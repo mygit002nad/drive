@@ -797,7 +797,7 @@ export async function installCloudflareWorkers(input: { mode: InstallMode; token
       for (const worker of ORDER) {
         const current = state.workers[worker]
         const artifactEntry = manifest.workers[worker]
-        const artifactMatches = current.releaseVersion === manifest.version && current.artifactSha256 === artifactEntry.sha256.toLowerCase()
+        const artifactMatches = current.artifactSha256 === artifactEntry.sha256.toLowerCase()
         // A failed runtime verification can mean the Worker bindings drifted
         // from the dashboard's authoritative settings even when the script
         // checksum is unchanged. Repair must re-upload the script so its
@@ -811,6 +811,12 @@ export async function installCloudflareWorkers(input: { mode: InstallMode; token
           state.workers[worker].deployed = true; state.workers[worker].phase = "deployed"; state.workers[worker].deployedAt = new Date().toISOString()
           state.workers[worker].releaseVersion = manifest.version; state.workers[worker].artifactSha256 = artifactEntry.sha256.toLowerCase()
           state.step = `${worker}_deployed`; await saveState(state)
+        } else {
+          // A release can update one Worker bundle. Advance unchanged workers'
+          // release metadata without uploading their identical script again.
+          current.releaseVersion = manifest.version
+          current.artifactSha256 = artifactEntry.sha256.toLowerCase()
+          await saveState(state)
         }
       }
       await configureConsumer(tokens.scanner, accounts.scanner.id, names.scannerQueue, names.scannerDlq, state.workers.scanner.scriptName, 15)

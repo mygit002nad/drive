@@ -55,6 +55,7 @@ function statusBadge(status?: string) {
   if (["completed", "complete", "copied", "verified"].includes(value)) return <Badge>Completed</Badge>
   if (value === "processing") return <Badge variant="secondary">Processing</Badge>
   if (value === "dispatching") return <Badge variant="secondary">Dispatching</Badge>
+  if (value === "retrying") return <Badge className="bg-amber-600">Retrying</Badge>
   if (["running", "copying", "transferring"].includes(value)) return <Badge>Running</Badge>
   if (["scanning", "verifying"].includes(value)) return <Badge variant="secondary">{value === "scanning" ? "Scanning" : "Verifying"}</Badge>
   if (["pending", "queued", "claimed"].includes(value)) return <Badge variant="outline">Queued</Badge>
@@ -88,6 +89,7 @@ export default function MigrationWorkerPoolDetailsPage() {
   const [selectedJob, setSelectedJob] = React.useState<RepairJob | null>(null)
   const [selectedJobId, setSelectedJobId] = React.useState<string | null>(null)
   const [loading, setLoading] = React.useState(true)
+  const [loadError, setLoadError] = React.useState("")
   const [refreshing, setRefreshing] = React.useState(false)
   const [mutating, setMutating] = React.useState(false)
   const [deleteOpen, setDeleteOpen] = React.useState(false)
@@ -105,6 +107,7 @@ export default function MigrationWorkerPoolDetailsPage() {
       const [poolResponse, detailResponse] = await Promise.all([poolRequest, detailRequest])
       const data = await poolResponse.json().catch(() => ({}))
       if (!poolResponse.ok) throw new Error(data.error || "Unable to load migration worker pool")
+      setLoadError("")
       if (selectedGenerationRef.current > 0 && Number(data.selectedGeneration) !== selectedGenerationRef.current) return
       setJobs(Array.isArray(data.jobs) ? data.jobs : [])
       setLiveFiles(Array.isArray(data.liveFiles) ? data.liveFiles.filter(isRecord) : [])
@@ -129,6 +132,7 @@ export default function MigrationWorkerPoolDetailsPage() {
       }
     } catch (error) {
       setLiveFiles([])
+      setLoadError(error instanceof Error ? error.message : "Unable to load migration worker pool")
       if (!options?.background) toast.error(error instanceof Error ? error.message : "Unable to load migration worker pool")
     } finally {
       inFlight.current = false
@@ -214,7 +218,7 @@ export default function MigrationWorkerPoolDetailsPage() {
     { accessorKey: "targetBucket", header: "Target", meta: { width: "min-w-[200px]", align: "center" }, cell: ({ row }) => <span className="break-all text-[13px] font-medium">{row.original.targetBucket}</span> },
     { accessorKey: "status", header: "Status", meta: { width: "min-w-[120px]", align: "center" }, cell: ({ row }) => <div className="flex min-h-10 items-center justify-center">{statusBadge(poolBucketTransferStatus(row.original))}</div> },
     { id: "total", header: "Total", meta: { width: "min-w-[110px]", align: "center" }, cell: ({ row }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.totalObjects))}</span> },
-    { id: "queue", header: "Queue", meta: { width: "min-w-[110px]", align: "center" }, cell: ({ row }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.queuedObjects))}</span> },
+    ...(snapshot.buckets?.some((bucket) => num(bucket.queuedObjects) > 0) ? [{ id: "queue", header: "Queue", meta: { width: "min-w-[110px]", align: "center" }, cell: ({ row }: { row: { original: BucketStat } }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.queuedObjects))}</span> }] : []),
     { id: "inProgress", header: "In progress", meta: { width: "min-w-[110px]", align: "center" }, cell: ({ row }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.runningObjects))}</span> },
     { id: "transferred", header: "Transferred", meta: { width: "min-w-[130px]", align: "center" }, cell: ({ row }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.transferredObjects))}</span> },
     ...(snapshot.buckets?.some((bucket) => num(bucket.skippedObjects) > 0) ? [{ id: "skipped", header: "Skipped", meta: { width: "min-w-[120px]", align: "center" }, cell: ({ row }: { row: { original: BucketStat } }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.skippedObjects))}</span> }] : []),
@@ -352,6 +356,22 @@ export default function MigrationWorkerPoolDetailsPage() {
   const poolProgress = percentage(poolCompletedJobs, attemptTotalJobs)
   const workerRuntimeSeconds = num(snapshot.workerRuntimeSeconds)
   const inProgressFiles = num(snapshot.inProgressFiles ?? snapshot.activeTransfers)
+
+  if (loadError && !snapshot.updatedAt && totalJobs === 0) return <DashboardPage className="dashboard-motion-stage">
+    <Card className="mx-auto mt-8 w-full max-w-2xl gap-0 py-0">
+      <CardHeader className="px-5 py-4">
+        <CardTitle className="text-base">Worker pool data unavailable</CardTitle>
+        <CardDescription>The dashboard could not read this migration’s queue database, so it is hiding empty fallback counts.</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4 px-5 pb-5 pt-0">
+        <p className="break-words text-sm text-destructive">{loadError}</p>
+        <div className="flex gap-2">
+          <Button asChild variant="outline" size="sm"><Link href={`/dashboard/migrations/${encodeURIComponent(migrationId)}`}><ArrowLeft data-icon="inline-start" />Back to migration</Link></Button>
+          <Button variant="outline" size="sm" onClick={() => void load({ manual: true })} disabled={refreshing}><RefreshCw data-icon="inline-start" className={refreshing ? "animate-spin" : undefined} />Retry</Button>
+        </div>
+      </CardContent>
+    </Card>
+  </DashboardPage>
 
   return <DashboardPage className="dashboard-motion-stage">
     <div className="flex flex-col gap-4">

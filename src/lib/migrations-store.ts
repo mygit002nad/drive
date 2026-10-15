@@ -31,6 +31,8 @@ export type MigrationOptions = {
   manualCompleted?: boolean
   targetActivatedAt?: string
   workerPoolLiveStats?: Record<string, number>
+  /** Queue seeding is still processing; expose no copied-row count in the migration card. */
+  workerPoolQueueSeeding?: boolean
   historyReadOnlyAt?: string
   historyReadOnlyReason?: string
 

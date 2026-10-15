@@ -17,7 +17,6 @@ import {
   Square,
   ShieldCheck,
   Trash2,
-  ListTodo,
   Users,
 } from "lucide-react"
 
@@ -75,6 +74,7 @@ type Migration = {
     executionMode?: "super_slurper" | "migration_workers"
     workerGeneration?: number
     workerShardCount?: number
+    workerPoolQueueSeeding?: boolean
     overwrite?: boolean
     concurrency?: number
     pathPrefix?: string | null
@@ -245,6 +245,7 @@ function statusBadge(
   if (s === "verifying") return <Badge className="bg-purple-600">Verifying</Badge>
   if (s === "scanning") return <Badge className="bg-sky-600">Scanning</Badge>
   if (s === "queued") return <Badge variant="secondary">Queued</Badge>
+  if (s === "retrying") return <Badge className="bg-amber-600">Retrying</Badge>
   if (s === "running") return <Badge className="bg-primary text-primary-foreground">Running</Badge>
   if (s === "progress_fetch_failed") return <Badge className="bg-primary text-primary-foreground">Running</Badge>
   if (s === "paused") return <Badge className="bg-yellow-600">Paused</Badge>
@@ -265,6 +266,7 @@ function statusBadge(
 
 function migrationWorkerBadge(status: string | undefined) {
   const value = String(status || "").toLowerCase()
+  if (value === "processing") return <Badge variant="secondary">Processing</Badge>
   if (value === "completed") return <Badge className="bg-green-600">Worker completed</Badge>
   if (value === "deploying") return <Badge className="bg-yellow-600">Worker deploying</Badge>
   if (value === "aborting") return <Badge className="bg-yellow-600">Worker stopping</Badge>
@@ -333,8 +335,12 @@ function mergeIncomingItem(prev: MigrationItem | undefined, next: MigrationItem)
   const mergedLive = {
     ...nextLive,
     totalObjects: Math.max(prevLive.totalObjects, nextLive.totalObjects),
-    transferredObjects: Math.max(prevLive.transferredObjects, nextLive.transferredObjects),
-    transferredBytes: Math.max(prevLive.transferredBytes, nextLive.transferredBytes),
+    transferredObjects: isTerminalBucketDisplayStatus(nextLive.status)
+      ? nextLive.transferredObjects
+      : Math.max(prevLive.transferredObjects, nextLive.transferredObjects),
+    transferredBytes: isTerminalBucketDisplayStatus(nextLive.status)
+      ? nextLive.transferredBytes
+      : Math.max(prevLive.transferredBytes, nextLive.transferredBytes),
     skippedObjects: isTerminalBucketDisplayStatus(nextLive.status)
       ? nextLive.skippedObjects
       : Math.max(prevLive.skippedObjects, nextLive.skippedObjects),
@@ -346,7 +352,9 @@ function mergeIncomingItem(prev: MigrationItem | undefined, next: MigrationItem)
       : Math.max(prevLive.verifyIssues, nextLive.verifyIssues),
   }
 
-  if (isTerminalBucketDisplayStatus(prevLive.status) && !isTerminalBucketDisplayStatus(nextLive.status)) {
+  if (normalizeStatus(nextLive.status) === "retrying") {
+    mergedLive.status = "retrying"
+  } else if (isTerminalBucketDisplayStatus(prevLive.status) && !isTerminalBucketDisplayStatus(nextLive.status)) {
     mergedLive.status = prevLive.status
   } else if (
     !isTerminalBucketDisplayStatus(prevLive.status) &&
@@ -1008,21 +1016,14 @@ export default function MigrationDetailsPage() {
   )
 
   const overviewBadgeStatus = React.useMemo(() => {
-    if (migration && ["completed", "failed", "verification_failed", "canceled"].includes(migration.status)) return migration.status
-    if (migration?.status === "verifying" && migration.syncMessage?.toLowerCase().includes("settings")) return "verifying"
-    if (bucketCounts.scanning > 0) return "scanning"
-    if (bucketCounts.running > 0) return "running"
-    if (bucketCounts.verifying > 0) return "verifying"
-    if (bucketCounts.failed > 0) return "failed"
-    if (bucketCounts.verificationFailed > 0) return "verification_failed"
-    if (bucketCounts.aborted > 0 && bucketCounts.completed + bucketCounts.failed + bucketCounts.aborted === bucketCounts.total && bucketCounts.failed === 0)
-      return "aborted"
-    if (bucketCounts.completed === bucketCounts.total && bucketCounts.total > 0) return "completed"
+    // The Overview badge represents the migration lifecycle owned by the
+    // orchestrator. Bucket and queue projections must never promote it to a
+    // terminal state independently.
     return migration?.status ?? "draft"
-  }, [bucketCounts, migration])
+  }, [migration?.status])
 
   const effectiveMigrationStatus = React.useMemo(() => {
-    if (overviewBadgeStatus === "aborted") return "canceled"
+    if (String(overviewBadgeStatus) === "aborted") return "canceled"
     return overviewBadgeStatus
   }, [overviewBadgeStatus])
 
@@ -1895,12 +1896,13 @@ export default function MigrationDetailsPage() {
                     ? stoppingRuns.length > 0 ? "aborting" : "aborted"
                     : migrationStatus === "verifying"
                       ? "verifying"
-                      : runningRuns.length > 0
-                        ? "running"
-                        : ["pending", "queued", "created", "dispatching"].includes(latestRunStatus)
-                          ? "deploying"
-                          : "queued"
-              const queueRemaining = items.reduce((sum, item) => sum + getBucketSnapshot(item).queued, 0)
+                      : migration.options.workerPoolQueueSeeding
+                        ? "processing"
+                        : runningRuns.length > 0
+                          ? "running"
+                          : ["pending", "queued", "created", "dispatching"].includes(latestRunStatus)
+                            ? "deploying"
+                            : "queued"
               const lastActivityAt = latestRun?.lastHeartbeatAt || latestRun?.updatedAt || migration.updatedAt
 
               return (
@@ -1912,7 +1914,7 @@ export default function MigrationDetailsPage() {
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-4">
-                    <dl className="grid gap-y-4 border-y py-4 sm:grid-cols-2 lg:grid-cols-4">
+                    <dl className="grid gap-y-4 border-y py-4 sm:grid-cols-2 lg:grid-cols-3">
                       <div className="flex min-w-0 items-start gap-3 sm:px-3 lg:border-r lg:first:pl-0">
                         <Users className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
                         <div className="min-w-0">
@@ -1925,13 +1927,6 @@ export default function MigrationDetailsPage() {
                         <div className="min-w-0">
                           <dt className="text-xs font-medium text-muted-foreground">Transferred</dt>
                           <dd className="mt-1 truncate text-sm font-medium tabular-nums">{formatNumber(overviewProgress.transferred)}</dd>
-                        </div>
-                      </div>
-                      <div className="flex min-w-0 items-start gap-3 sm:px-3 lg:border-r">
-                        <ListTodo className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                        <div className="min-w-0">
-                          <dt className="text-xs font-medium text-muted-foreground">Queue remaining</dt>
-                          <dd className="mt-1 truncate text-sm font-medium tabular-nums">{formatNumber(queueRemaining)}</dd>
                         </div>
                       </div>
                       <div className="flex min-w-0 items-start gap-3 sm:px-3 lg:pr-0">

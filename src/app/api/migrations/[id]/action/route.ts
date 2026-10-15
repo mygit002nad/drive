@@ -115,12 +115,17 @@ async function reserveMigrationWorkerGeneration(migrationId: string, expectedSta
       returning m.id, m.options->>'workerGeneration' generation
     ), reset_items as (
       update drive_migration_items i
-      set slurper_job_id=null,slurper_status='queued',
+      set slurper_job_id=null,slurper_status='running',
           progress=(coalesce(i.progress,'{}'::jsonb)||jsonb_build_object(
             'stage','awaiting_source_scan',
             'migrationInventory',jsonb_build_object('generation',claimed.generation::int,'status','pending'),
-            'migrationQueue',jsonb_build_object('generation',claimed.generation::int,'status','pending'),
-            'repairWorker',null,'live',null,
+            'migrationQueue',jsonb_build_object('generation',claimed.generation::int,'status','pending',
+              'retryBaseline',jsonb_build_object(
+                'totalObjects',coalesce(nullif(i.progress->'live'->>'totalObjects','')::bigint,i.source_objects,0),
+                'transferredObjects',coalesce(nullif(i.progress->'live'->>'transferredObjects','')::bigint,0),
+                'skippedObjects',coalesce(nullif(i.progress->'live'->>'skippedObjects','')::bigint,0),
+                'sourceBytes',coalesce(nullif(i.progress->'live'->>'sourceBytes','')::bigint,i.source_bytes,0))),
+            'repairWorker',null,'live',jsonb_build_object('status','retrying','workerStage','scanning','updatedAt',now()),
             'lastAction',jsonb_build_object('action',$4::text,'at',now())
           )),
           last_progress_at=now(),updated_at=now()
@@ -819,6 +824,16 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       const workerMode = migration.options.executionMode === "migration_workers"
       const candidates = items.filter((item) => {
         const s = normalizeStatus(item.slurperStatus)
+        if (workerMode) {
+          const progress = isRecord(item.progress) ? item.progress : {}
+          const live = isRecord(progress.live) ? progress.live : {}
+          const fileVerification = isRecord(progress.fileVerification) ? progress.fileVerification : {}
+          const verify = isRecord(progress.verify) ? progress.verify : {}
+          const verificationFailed = s === "verification_failed" || verify.status === "error" ||
+            (fileVerification.status === "completed" && (Number(fileVerification.missing) > 0 || Number(fileVerification.mismatched) > 0))
+          const transferFailed = s === "failed" || String(live.status || "").toLowerCase() === "failed" || Number(live.failedObjects || 0) > 0
+          return verificationFailed || transferFailed
+        }
         const verifyStatus = readVerifyStatus(
           isRecord(item.progress) ? (item.progress as Record<string, unknown>) : {}
         )
@@ -827,8 +842,28 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       })
 
       let workerGeneration = 0
+      let workerRetryObjectKeysByItem: Record<string, string[]> | undefined
       if (workerMode) {
         if (!candidates.length) return NextResponse.json({ error: "No failed or incomplete buckets need a worker-pool retry" }, { status: 409 })
+        const failedObjects = await queryDb<{ item_id: string; object_key: string }>(`
+          select item_id,object_key from (
+            select i.id::text item_id,inv->>'key' object_key
+            from drive_repair_jobs j
+            join lateral jsonb_array_elements_text(coalesce(j.payload->'itemIds','[]'::jsonb)) linked(item_id) on true
+            join drive_migration_items i on i.id::text=linked.item_id and i.migration_id=j.migration_id
+            cross join lateral jsonb_array_elements(coalesce(j.payload->'inventoryObjects','[]'::jsonb)) inv
+            where j.migration_id=$1 and i.id=any($2::uuid[])
+              and (j.status='failed' or case when coalesce(j.result->'items'->0->>'failed','0') ~ '^[0-9]+$' then (j.result->'items'->0->>'failed')::int>0 else false end)
+            union
+            select d.migration_item_id::text,d.key from drive_bucket_verify_diffs d
+            where d.migration_item_id=any($2::uuid[]) and d.kind in('missing','size_mismatch')
+          ) failed_keys where nullif(object_key,'') is not null order by item_id,object_key
+        `, [id, candidates.map((item) => item.id)])
+        workerRetryObjectKeysByItem = {}
+        for (const row of failedObjects.rows) {
+          const keys = workerRetryObjectKeysByItem[row.item_id] || (workerRetryObjectKeysByItem[row.item_id] = [])
+          if (!keys.includes(row.object_key)) keys.push(row.object_key)
+        }
         const reserved = await reserveMigrationWorkerGeneration(id, migration.status, candidates.map((item) => item.id), "retry_migration")
         if (reserved === null) {
           return NextResponse.json({ error: "This worker-pool migration is active, or its previous workers are still stopping. Wait for the current attempt to finish before retrying." }, { status: 409 })
@@ -880,17 +915,18 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         status: "running",
         completedAt: null,
         syncStatus: "ok",
-        syncMessage:
-          candidates.length > 0
-            ? `Retry queued for ${candidates.length} bucket(s) with overwrite disabled`
-            : "No buckets require retry",
+        syncMessage: candidates.length > 0
+          ? workerMode
+            ? `Scanning ${candidates.length} failed bucket(s); retrying failed object keys with overwrite disabled`
+            : `Retry queued for ${candidates.length} bucket(s) with overwrite disabled`
+          : "No buckets require retry",
         lastSyncedAt: now,
         options: {
           ...migration.options,
           manualCompleted: false,
           targetActivatedAt: undefined,
           ...(workerMode
-            ? { workerGeneration }
+            ? { workerGeneration, overwrite: false, workerRetryFailedObjectsOnly: true, workerRetryObjectKeysByItem }
             : {}),
         },
       })

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server"
 import { getMigrationDetailBootstrap } from "@/lib/migrations-store"
 import { requireAdmin } from "@/lib/server-auth"
 import { getMigrationWorkerSettings } from "@/lib/migration-worker-settings-store"
-import { readMigrationQueueLiveProjection } from "@/lib/migration-queue-database"
+import { overlayMigrationQueueItems, readMigrationQueueLiveProjection, resolveMigrationQueueLifecycleStatus } from "@/lib/migration-queue-database"
 
 export const runtime = "nodejs"
 
@@ -114,12 +114,14 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
               try {
                 const live = await readMigrationQueueLiveProjection(directQueue.url, directQueue.ssl, id, Math.max(0, Number(migration.options.workerGeneration || 0)))
                 if (live) {
-                  items = items.map((item) => {
-                    const current = live.items.find((entry) => entry.id === item.id)
-                    return current ? { ...item, slurperStatus: current.slurperStatus, progress: { ...item.progress, live: current.progress.live }, updatedAt: current.progress.live.updatedAt || item.updatedAt } : item
-                  })
+                  items = overlayMigrationQueueItems(items, live)
                   workerRuns = live.workerRuns
-                  migration = { ...migration, status: live.migrationStatus, options: { ...migration.options, workerPoolLiveStats: live.stats } }
+                  const failedObjects = items.reduce((sum, item) => {
+                    const progress = item.progress && typeof item.progress === "object" ? item.progress as Record<string, unknown> : {}
+                    const liveProgress = progress.live && typeof progress.live === "object" ? progress.live as Record<string, unknown> : {}
+                    return sum + Math.max(0, Number(liveProgress.failedObjects || 0))
+                  }, 0)
+                  migration = { ...migration, status: resolveMigrationQueueLifecycleStatus(migration.status, live), options: { ...migration.options, workerPoolLiveStats: { ...live.stats, failed: failedObjects } } }
                 }
               } catch {
                 // Fall back to the last Orchestrator projection if the queue database is briefly unreachable.

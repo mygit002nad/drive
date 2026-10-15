@@ -5,6 +5,8 @@ import { createMigration, getMigrationDashboardBootstrap } from "@/lib/migration
 import { getBucketStatsMap } from "@/lib/bucket-stats-store"
 import { requireAdmin } from "@/lib/server-auth"
 import { getRequestActivityContext } from "@/lib/activity-store"
+import { getMigrationWorkerSettings } from "@/lib/migration-worker-settings-store"
+import { overlayMigrationQueueItems, readMigrationQueueLiveProjection, resolveMigrationQueueLifecycleStatus } from "@/lib/migration-queue-database"
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
@@ -25,8 +27,36 @@ export async function GET() {
 
     // This page receives one bounded PostgreSQL snapshot. Account credentials
     // are excluded, and all bucket counts come from worker-owned projections.
-    const { migrations, accounts, activeAccount, bucketStats, activeItems } =
+    const { migrations: savedMigrations, accounts, activeAccount, bucketStats, activeItems: savedActiveItems } =
       await getMigrationDashboardBootstrap()
+    let migrations = savedMigrations
+    let activeItems = savedActiveItems
+    const activeMigration = migrations.find((migration) => migration.status === "running")
+      ?? migrations.find((migration) => migration.status === "verifying")
+      ?? migrations.find((migration) => migration.status === "draft")
+      ?? migrations[0]
+      ?? null
+    if (activeMigration?.options.executionMode === "migration_workers") {
+      const settings = await getMigrationWorkerSettings()
+      if (settings.queueDatabaseUrl) {
+        try {
+          const live = await readMigrationQueueLiveProjection(settings.queueDatabaseUrl, settings.queueDatabaseSsl, activeMigration.id, Math.max(0, Number(activeMigration.options.workerGeneration || 0)))
+          if (live) {
+            activeItems = overlayMigrationQueueItems(activeItems, live)
+            const failedObjects = activeItems.reduce((sum, item) => {
+              const progress = item.progress && typeof item.progress === "object" ? item.progress as Record<string, unknown> : {}
+              const liveProgress = progress.live && typeof progress.live === "object" ? progress.live as Record<string, unknown> : {}
+              return sum + Math.max(0, Number(liveProgress.failedObjects || 0))
+            }, 0)
+            migrations = migrations.map((migration) => migration.id === activeMigration.id
+              ? { ...migration, status: resolveMigrationQueueLifecycleStatus(migration.status, live), options: { ...migration.options, workerPoolLiveStats: { ...live.stats, failed: failedObjects }, workerPoolQueueSeeding: live.seedComplete !== true } }
+              : migration)
+          }
+        } catch {
+          // Preserve the persisted dashboard snapshot if the queue database is temporarily unavailable.
+        }
+      }
+    }
     const bucketError = (
       !activeAccount
         ? "No active Cloudflare account"

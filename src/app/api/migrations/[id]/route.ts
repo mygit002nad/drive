@@ -4,7 +4,7 @@ import { requireAdmin } from "@/lib/server-auth"
 import { getMigrationReadOnlyState } from "@/lib/migration-read-only"
 import { getRequestActivityContext, recordActivity } from "@/lib/activity-store"
 import { getMigrationWorkerSettings } from "@/lib/migration-worker-settings-store"
-import { readMigrationQueueLiveProjection } from "@/lib/migration-queue-database"
+import { overlayMigrationQueueItems, readMigrationQueueLiveProjection, resolveMigrationQueueLifecycleStatus } from "@/lib/migration-queue-database"
 
 export async function GET(
   _request: Request,
@@ -29,13 +29,16 @@ export async function GET(
         try {
           const live = await readMigrationQueueLiveProjection(settings.queueDatabaseUrl, settings.queueDatabaseSsl, id, generation)
           if (live) {
-            items = items.map((item) => {
-              const current = live.items.find((entry) => entry.id === item.id)
-              return current ? { ...item, slurperStatus: current.slurperStatus, progress: { ...item.progress, live: current.progress.live }, updatedAt: current.progress.live.updatedAt || item.updatedAt } : item
-            })
+            items = overlayMigrationQueueItems(items, live)
             workerRuns = live.workerRuns
-            migration = { ...migration, status: live.migrationStatus, options: { ...migration.options, workerPoolLiveStats: live.stats } }
-            workerPoolLiveStats = live.stats
+            const failedObjects = items.reduce((sum, item) => {
+              const progress = item.progress && typeof item.progress === "object" ? item.progress as Record<string, unknown> : {}
+              const liveProgress = progress.live && typeof progress.live === "object" ? progress.live as Record<string, unknown> : {}
+              return sum + Math.max(0, Number(liveProgress.failedObjects || 0))
+            }, 0)
+            const stats = { ...live.stats, failed: failedObjects }
+            migration = { ...migration, status: resolveMigrationQueueLifecycleStatus(migration.status, live), options: { ...migration.options, workerPoolLiveStats: stats, workerPoolQueueSeeding: live.seedComplete !== true } }
+            workerPoolLiveStats = stats
           }
         } catch {
           // Keep the saved primary-database projection available during queue-database outages.
