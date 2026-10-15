@@ -16,6 +16,19 @@ const TRANSIENT_SCAN_SQL_PATTERN = "(connection terminated unexpectedly|connecti
 let authCache: { value: string[]; expiresAt: number } | null = null
 let adaptiveQueueBatchSize = DEFAULT_QUEUE_BATCH_SIZE
 let schemaReady: Promise<void> | null = null
+const workerRepositorySyncs = new Map<string, ReturnType<typeof syncWorkerRepository>>()
+
+function syncWorkerRepositoryOnce(input: Parameters<typeof syncWorkerRepository>[0]) {
+  const key = [input.owner, input.repo, input.workflow, input.sourceRepo || "", input.activateActions ? "activate" : ""].join("/")
+  const existing = workerRepositorySyncs.get(key)
+  if (existing) return existing
+  const pending = syncWorkerRepository(input)
+  workerRepositorySyncs.set(key, pending)
+  void pending.finally(() => {
+    if (workerRepositorySyncs.get(key) === pending) workerRepositorySyncs.delete(key)
+  }).catch(() => undefined)
+  return pending
+}
 
 function tuneQueueBatchSize(elapsedMs: number, succeeded: boolean) {
   if (!succeeded) adaptiveQueueBatchSize = Math.max(MIN_QUEUE_BATCH_SIZE, Math.floor(adaptiveQueueBatchSize / 2))
@@ -1620,14 +1633,7 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
   const budget = integer(orchestration.maxDispatchesPerCycle, 100, 1, 100)
   const stranded = await db.query(`select id from drive_agent_runs where run_type='github_dispatch' and status='pending' and payload->>'migrationId'=$1 and greatest(1,coalesce(nullif(payload->>'workerGeneration','')::int,1))=$2 and coalesce(payload->>'phase','created') in('created','queued') order by created_at limit $3`, [migration.id, generation, budget])
   let queued = 0
-  for (const row of stranded.rows) {
-    try {
-      const outcome = await consumeDispatch(env, String(row.id), 0)
-      if (["accepted", "awaiting_reconciliation", "reconciled"].includes(outcome)) queued += 1
-    } catch (error) {
-      console.error("Durable GitHub dispatch intent deferred", String(row.id), error instanceof Error ? error.message : String(error))
-    }
-  }
+  const dispatchIntents: string[] = stranded.rows.map((row) => String(row.id))
   // Every registered GitHub workflow contributes its configured capacity to
   // every active worker-pool migration. Re-read this set on every cycle so a
   // workflow registered mid-migration joins automatically.
@@ -1761,13 +1767,25 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
         returning id
       `, [agent.id, JSON.stringify({ migrationId: migration.id, workerGeneration: generation, pool: true, workerInstanceId, source: "migration_orchestrator", phase: "created" }), migration.id, generation])
       if (!intent.rows[0]) return queued
-      try {
-        const outcome = await consumeDispatch(env, String(intent.rows[0].id), 0)
-        if (["accepted", "awaiting_reconciliation", "reconciled"].includes(outcome)) queued += 1
-      } catch (error) {
-        console.error("New durable GitHub dispatch intent deferred", String(intent.rows[0].id), error instanceof Error ? error.message : String(error))
-      }
+      dispatchIntents.push(String(intent.rows[0].id))
     }
+  }
+  // Dispatch in small concurrent batches. The old serial loop could take
+  // minutes to fill a configured pool, while each dispatch held a database
+  // transaction open across GitHub API calls. Three concurrent slots keep
+  // connection pressure bounded while allowing the worker pool to start.
+  const dispatchConcurrency = 3
+  for (let offset = 0; offset < dispatchIntents.length; offset += dispatchConcurrency) {
+    const batch = dispatchIntents.slice(offset, offset + dispatchConcurrency)
+    const outcomes = await Promise.all(batch.map(async (intentId) => {
+      try {
+        return await consumeDispatch(env, intentId, 0)
+      } catch (error) {
+        console.error("New durable GitHub dispatch intent deferred", intentId, error instanceof Error ? error.message : String(error))
+        return "deferred"
+      }
+    }))
+    queued += outcomes.filter((outcome) => ["accepted", "awaiting_reconciliation", "reconciled"].includes(outcome)).length
   }
   return queued
 }
@@ -1944,7 +1962,7 @@ async function consumeDispatch(env: Env, intentId: string, attempts: number) {
       const current = await db.query(`select m.status,greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1)) generation,
         exists(select 1 from drive_repair_jobs j where j.migration_id=m.id and j.mode='migration' and j.status='canceled'
           and not exists(select 1 from drive_repair_jobs newer where newer.migration_id=j.migration_id and newer.mode='migration' and (newer.created_at,newer.id)>(j.created_at,j.id))) pool_stopped
-        from drive_migrations m where m.id=$1 for update`, [intent.payload.migrationId])
+        from drive_migrations m where m.id=$1`, [intent.payload.migrationId])
       const migration = current.rows[0]
       const intentGeneration = integer(intent.payload.workerGeneration, 1, 1, 1000000)
       if (!migration || migration.pool_stopped || !["running", "verifying"].includes(String(migration.status)) || Number(migration.generation) !== intentGeneration) {
@@ -1972,7 +1990,7 @@ async function consumeDispatch(env: Env, intentId: string, attempts: number) {
       return "terminal"
     }
     const workerInstanceId = String(intent.payload.workerInstanceId)
-    const codeSync = await syncWorkerRepository({ token: intent.github_token, owner: intent.github_repo_owner, repo: intent.github_repo_name, workflow: intent.github_workflow_file || ".github/workflows/migration-worker.yml", sourceRepo: env.GITHUB_WORKER_SOURCE_REPO, activateActions: intent.agent_status === "dispatch_ready" })
+    const codeSync = await syncWorkerRepositoryOnce({ token: intent.github_token, owner: intent.github_repo_owner, repo: intent.github_repo_name, workflow: intent.github_workflow_file || ".github/workflows/migration-worker.yml", sourceRepo: env.GITHUB_WORKER_SOURCE_REPO, activateActions: intent.agent_status === "dispatch_ready" })
     await db.query(`update drive_agents set github_ref=$2,updated_at=now() where id=$1`, [intent.agent_id, codeSync.defaultBranch])
     await db.query(`update drive_agent_runs set payload=payload||$2::jsonb where id=$1`, [intent.id, JSON.stringify({ sourceCommit: codeSync.sourceSha, workerCommit: codeSync.targetSha, ref: codeSync.defaultBranch })])
     await db.query(`update drive_agent_runs set payload=payload||$2::jsonb,summary='Submitting GitHub workflow dispatch',updated_at=now() where id=$1`, [intent.id, JSON.stringify({ phase: "dispatching", dispatchStartedAt: new Date().toISOString(), dispatchAttempt: attempts })])
