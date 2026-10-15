@@ -86,9 +86,12 @@ function databaseLabel(config) {
 }
 
 async function main() {
-  if (booleanValue("DRIVE_SKIP_SCHEMA_BUILD", false)) {
-    console.warn(
-      "[db:schema] skipped because DRIVE_SKIP_SCHEMA_BUILD is enabled"
+  const skipForVercelBuild = booleanValue("DRIVE_SKIP_SCHEMA_BUILD", booleanValue("VERCEL", false))
+  if (skipForVercelBuild) {
+    console.log(
+      value("DRIVE_SKIP_SCHEMA_BUILD")
+        ? "[db:schema] skipped because DRIVE_SKIP_SCHEMA_BUILD is enabled"
+        : "[db:schema] skipped during Vercel build; runtime schema checks handle required updates"
     )
     return
   }

@@ -158,7 +158,9 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       if (!orchestrator.orchestratorUrl || !orchestrator.sharedSecret) {
         return NextResponse.json({ error: "Migration Orchestrator URL and secret are required for worker-pool dispatch" }, { status: 409 })
       }
-      const workerSecret = (await getMigrationWorkerSettings()).sharedSecret
+      const workerSettings = await getMigrationWorkerSettings()
+      const workerSecret = workerSettings.sharedSecret
+      if (!workerSettings.queueDatabaseUrl) return NextResponse.json({ error: "Configure the Migration Queue PostgreSQL URL in Settings before starting a worker-pool migration" }, { status: 409 })
       if (workerSecret.length < 24 || workerSecret.length > 512) {
         return NextResponse.json({ error: "Configure the Migration Worker secret in Settings before dispatching a workflow" }, { status: 409 })
       }

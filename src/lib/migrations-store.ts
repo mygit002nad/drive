@@ -30,6 +30,7 @@ export type MigrationOptions = {
   sourceMode?: "r2" | "s3"
   manualCompleted?: boolean
   targetActivatedAt?: string
+  workerPoolLiveStats?: Record<string, number>
   historyReadOnlyAt?: string
   historyReadOnlyReason?: string
 

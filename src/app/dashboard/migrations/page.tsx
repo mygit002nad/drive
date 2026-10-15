@@ -289,7 +289,6 @@ export default function MigrationsPage() {
             </span>
             <span className="truncate text-[10px] leading-4 text-muted-foreground">
               {migration.options.executionMode === "migration_workers" ? "Worker pool" : "Super Slurper"}
-              {visibleSyncMessage(migration.syncMessage) ? ` · ${visibleSyncMessage(migration.syncMessage)}` : ""}
             </span>
           </div>
         )

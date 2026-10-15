@@ -2,6 +2,7 @@ const { test } = process.getBuiltinModule("node:test")
 const assert = process.getBuiltinModule("node:assert/strict")
 const fs = process.getBuiltinModule("node:fs")
 const path = process.getBuiltinModule("node:path")
+const { execFileSync } = process.getBuiltinModule("node:child_process")
 
 const root = path.resolve(__dirname, "..")
 const read = (file) => fs.readFileSync(path.join(root, file), "utf8")
@@ -14,6 +15,17 @@ test("build and runtime schema guards use the same schema version", () => {
 
   assert.ok(runtimeVersion, "runtime schema version is declared")
   assert.equal(buildVersion, runtimeVersion)
+})
+
+test("Vercel builds skip the database-backed schema installer by default", () => {
+  const output = execFileSync(process.execPath, [path.join(root, "scripts/prepare-schema.mjs")], {
+    cwd: root,
+    encoding: "utf8",
+    env: { ...process.env, VERCEL: "1", DRIVE_SKIP_SCHEMA_BUILD: "" },
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  assert.match(output, /skipped during Vercel build/)
+  assert.doesNotMatch(output, /applying .*drive_schema\.sql/)
 })
 
 test("users pagination and substring search use concurrent indexes in both schema paths", () => {

@@ -59,6 +59,7 @@ jobs:
           AGENT_ID: ${{ github.event.client_payload.agent_id }}
           WORKER_INSTANCE_ID: ${{ github.event.client_payload.worker_instance_id || github.run_id }}
           DRIVE_MIGRATION_ID: ${{ github.event.client_payload.migration_id }}
+          DRIVE_WORKER_GENERATION: ${{ github.event.client_payload.worker_generation || '' }}
           DRIVE_REPAIR_JOB_ID: ${{ github.event.client_payload.repair_job_id || '' }}
           TOKEN: ${{ secrets.DRIVE_WORKER_SHARED_SECRET }}
           EXIT_AFTER_JOB: ${{ github.event.client_payload.repair_job_id && 'true' || 'false' }}

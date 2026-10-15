@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1127.0",
-    "@aws-sdk/lib-storage": "^3.1127.0"
+    "@aws-sdk/lib-storage": "^3.1127.0",
+    "pg": "^8.23.1"
   },
   "overrides": {
     "ws": "^8.21.3"

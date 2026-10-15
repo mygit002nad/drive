@@ -6,6 +6,8 @@ const MAX_SECRET_LENGTH = 512
 
 export type MigrationWorkerSettings = {
   sharedSecret: string
+  queueDatabaseUrl: string
+  queueDatabaseSsl: boolean
   previousSharedSecrets: Array<{ secret: string; expiresAt: string }>
   updatedAt?: string
   secretSyncStatus: "ready" | "syncing" | "failed" | "unverified"
@@ -37,6 +39,8 @@ function normalize(value: unknown, updatedAt?: string | null): MigrationWorkerSe
     : []
   return {
     sharedSecret: normalizeSecret(row.sharedSecret),
+    queueDatabaseUrl: normalizeSecret(row.queueDatabaseUrl),
+    queueDatabaseSsl: row.queueDatabaseSsl !== false,
     previousSharedSecrets,
     updatedAt: updatedAt ?? undefined,
     secretSyncStatus: row.secretSyncStatus === "ready" || row.secretSyncStatus === "syncing" || row.secretSyncStatus === "failed"
@@ -71,7 +75,7 @@ export async function getMigrationWorkerSharedSecret(): Promise<string> {
   return (await getMigrationWorkerSettings()).sharedSecret
 }
 
-export async function saveMigrationWorkerSettings(input: { sharedSecret?: unknown }): Promise<MigrationWorkerSettings> {
+export async function saveMigrationWorkerSettings(input: { sharedSecret?: unknown; queueDatabaseUrl?: unknown; queueDatabaseSsl?: unknown }): Promise<MigrationWorkerSettings> {
   const current = await getMigrationWorkerSettings()
   const requested = normalizeSecret(input.sharedSecret)
   const nextSecret = requested || current.sharedSecret
@@ -80,6 +84,18 @@ export async function saveMigrationWorkerSettings(input: { sharedSecret?: unknow
   }
   if (nextSecret.length > MAX_SECRET_LENGTH) {
     throw new Error(`Migration worker shared secret must be at most ${MAX_SECRET_LENGTH} characters`)
+  }
+
+  const requestedQueueUrl = typeof input.queueDatabaseUrl === "string" ? input.queueDatabaseUrl.trim() : ""
+  const queueDatabaseUrl = requestedQueueUrl || current.queueDatabaseUrl
+  const queueDatabaseSsl = typeof input.queueDatabaseSsl === "boolean" ? input.queueDatabaseSsl : current.queueDatabaseSsl
+  if (queueDatabaseUrl) {
+    let parsed: URL
+    try { parsed = new URL(queueDatabaseUrl) } catch { throw new Error("Migration queue database URL must be a valid PostgreSQL connection URL") }
+    if (!["postgres:", "postgresql:"].includes(parsed.protocol) || !parsed.hostname || !parsed.username || !parsed.password) {
+      throw new Error("Migration queue database URL must include PostgreSQL scheme, host, username, and password")
+    }
+    if (queueDatabaseUrl.length > 4096) throw new Error("Migration queue database URL must be at most 4096 characters")
   }
 
   const previousSharedSecrets = current.previousSharedSecrets.filter((entry) => Date.parse(entry.expiresAt) > Date.now())
@@ -94,7 +110,7 @@ export async function saveMigrationWorkerSettings(input: { sharedSecret?: unknow
       on conflict (key) do update set value = coalesce(drive_app_settings.value,'{}'::jsonb)||excluded.value, updated_at = now()
       returning value, updated_at
     `,
-    [SETTINGS_KEY, JSON.stringify({ sharedSecret: nextSecret, previousSharedSecrets })]
+    [SETTINGS_KEY, JSON.stringify({ sharedSecret: nextSecret, previousSharedSecrets, ...(requestedQueueUrl ? { queueDatabaseUrl } : {}), queueDatabaseSsl })]
   )
   return normalize(rows[0]?.value, rows[0]?.updated_at)
 }
@@ -124,6 +140,8 @@ export function publicMigrationWorkerSettings(settings: MigrationWorkerSettings)
   return {
     sharedSecret: settings.sharedSecret,
     secretConfigured: settings.sharedSecret.length >= MIN_SECRET_LENGTH && settings.sharedSecret.length <= MAX_SECRET_LENGTH,
+    queueDatabaseConfigured: Boolean(settings.queueDatabaseUrl),
+    queueDatabaseSsl: settings.queueDatabaseSsl,
     updatedAt: settings.updatedAt,
     secretSyncStatus: settings.secretSyncStatus,
     secretSyncError: settings.secretSyncError,

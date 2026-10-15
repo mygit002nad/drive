@@ -1470,12 +1470,12 @@ export default function MigrationDetailsPage() {
       meta: { width: "min-w-[100px]", align: "center" },
       cell: ({ row }) => <span className="font-mono text-xs">{formatNumber(getBucketSnapshot(row.original).skipped)}</span>,
     } satisfies ColumnDef<MigrationItem, unknown>] : []),
-    {
+    ...(migration?.options.executionMode === "migration_workers" ? [{
       id: "queued",
       header: "Queue",
       meta: { width: "min-w-[100px]", align: "center" },
       cell: ({ row }) => <span className="font-mono text-xs">{formatNumber(getBucketSnapshot(row.original).queued)}</span>,
-    },
+    } satisfies ColumnDef<MigrationItem, unknown>] : []),
     ...(showFailedColumn ? [{
       id: "failed",
       header: "Failed",

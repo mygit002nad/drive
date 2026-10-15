@@ -532,11 +532,11 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         const message = error instanceof Error ? error.message : "Failed to activate migrated account"
         const permanentFailure = isPermanentAccountCommunicationFailure(message)
         await updateMigration(id, {
-          status: "completed",
-          completedAt,
+          status: "verifying",
+          completedAt: null,
           syncStatus: "error",
           syncMessage: `Settings synced, but target activation failed: ${message}`,
-          lastSyncedAt: completedAt,
+          lastSyncedAt: new Date().toISOString(),
           options: {
             ...migration.options,
             targetActivatedAt: undefined,
@@ -548,7 +548,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
               : {}),
           },
         })
-        return NextResponse.json({ error: message }, { status: 400 })
+        return NextResponse.json({ error: `Settings synced, but the migration remains verifying because target activation failed: ${message}` }, { status: 502 })
       }
       await updateMigration(id, {
         status: "completed",
@@ -590,6 +590,25 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       } catch (error: unknown) {
         settingsSyncWarning = error instanceof Error ? error.message : "Settings sync failed"
       }
+      if (settingsSyncWarning) {
+        const failedAt = new Date().toISOString()
+        await updateMigration(id, {
+          status: "verifying",
+          completedAt: null,
+          syncStatus: "error",
+          syncMessage: settingsSyncWarning,
+          lastSyncedAt: failedAt,
+          options: {
+            ...migration.options,
+            manualCompleted: true,
+            targetActivatedAt: undefined,
+            ...(isPermanentAccountCommunicationFailure(settingsSyncWarning)
+              ? { historyReadOnlyAt: failedAt, historyReadOnlyReason: "Cloudflare account communication failed during settings sync" }
+              : {}),
+          },
+        })
+        return NextResponse.json({ error: `Settings synchronization failed; the migration remains verifying: ${settingsSyncWarning}` }, { status: 502 })
+      }
       const completedAt = new Date().toISOString()
       let activationError = ""
       try {
@@ -597,25 +616,35 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       } catch (error: unknown) {
         activationError = error instanceof Error ? error.message : "Failed to activate migrated account"
       }
-      const warning = [settingsSyncWarning, activationError ? `Target activation failed: ${activationError}` : ""]
-        .filter(Boolean)
-        .join("; ")
+      if (activationError) {
+        const failedAt = new Date().toISOString()
+        await updateMigration(id, {
+          status: "verifying",
+          completedAt: null,
+          syncStatus: "error",
+          syncMessage: `Settings synced, but target activation failed: ${activationError}`,
+          lastSyncedAt: failedAt,
+          options: {
+            ...migration.options,
+            manualCompleted: true,
+            targetActivatedAt: undefined,
+            ...(isPermanentAccountCommunicationFailure(activationError)
+              ? { historyReadOnlyAt: failedAt, historyReadOnlyReason: "Target account activation is unavailable" }
+              : {}),
+          },
+        })
+        return NextResponse.json({ error: `Target account activation failed; the migration remains verifying: ${activationError}` }, { status: 502 })
+      }
       await updateMigration(id, {
         status: "completed",
         completedAt,
-        syncStatus: warning ? "error" : "ok",
-        syncMessage: warning,
+        syncStatus: "ok",
+        syncMessage: "",
         lastSyncedAt: completedAt,
         options: {
           ...migration.options,
           manualCompleted: true,
-          ...(activationError ? { targetActivatedAt: undefined } : { targetActivatedAt: completedAt }),
-          ...(isPermanentAccountCommunicationFailure(`${settingsSyncWarning} ${activationError}`)
-            ? {
-                historyReadOnlyAt: completedAt,
-                historyReadOnlyReason: "Cloudflare account communication failed during settings sync",
-              }
-            : {}),
+          targetActivatedAt: completedAt,
         },
       })
       const afterAccounts = await getAllAccounts()
@@ -648,7 +677,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         undoReason: "Completed migrations permanently change the active account. Disabled accounts cannot be restored.",
         ...getRequestActivityContext(request),
       })
-      return NextResponse.json({ ok: true, ...(warning ? { warning } : {}) }, { status: 200 })
+      return NextResponse.json({ ok: true }, { status: 200 })
     }
 
     if (action === "verify_all") {

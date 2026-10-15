@@ -67,6 +67,21 @@ export default function DashboardSettingsPage() {
   const [migrationOrchestratorLoaded, setMigrationOrchestratorLoaded] = React.useState(false)
   const [migrationOrchestratorBusy, setMigrationOrchestratorBusy] = React.useState(false)
   const [migrationOrchestratorMessage, setMigrationOrchestratorMessage] = React.useState("")
+  const [migrationQueueDatabaseUrl, setMigrationQueueDatabaseUrl] = React.useState("")
+  const [migrationQueueDatabaseConfigured, setMigrationQueueDatabaseConfigured] = React.useState(false)
+  const [migrationQueueDatabaseSsl, setMigrationQueueDatabaseSsl] = React.useState(true)
+  const [migrationQueueDatabaseBusy, setMigrationQueueDatabaseBusy] = React.useState(false)
+  const [migrationQueueDatabaseMessage, setMigrationQueueDatabaseMessage] = React.useState("")
+
+  React.useEffect(() => {
+    void fetch("/api/settings/migration-workers", { cache: "no-store" }).then(async (response) => {
+      const payload = await response.json().catch(() => ({})) as { settings?: { queueDatabaseConfigured?: boolean; queueDatabaseSsl?: boolean } }
+      if (response.ok) {
+        setMigrationQueueDatabaseConfigured(payload.settings?.queueDatabaseConfigured === true)
+        setMigrationQueueDatabaseSsl(payload.settings?.queueDatabaseSsl !== false)
+      }
+    }).catch(() => undefined)
+  }, [])
 
   const loadOrchestratorSettings = React.useCallback(async () => {
     const response = await fetch("/api/settings/backend-orchestrator", { cache: "no-store" })
@@ -131,6 +146,22 @@ export default function DashboardSettingsPage() {
       setMigrationOrchestratorMessage(error instanceof Error ? error.message : String(error))
     })
   }, [loadMigrationOrchestratorSettings])
+
+  const saveMigrationQueueDatabase = async () => {
+    setMigrationQueueDatabaseBusy(true)
+    setMigrationQueueDatabaseMessage("")
+    try {
+      const response = await fetch("/api/settings/migration-workers", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ queueDatabaseUrl: migrationQueueDatabaseUrl, queueDatabaseSsl: migrationQueueDatabaseSsl }) })
+      const payload = await response.json().catch(() => ({})) as { error?: string; settings?: { queueDatabaseConfigured?: boolean; queueDatabaseSsl?: boolean } }
+      if (!response.ok) throw new Error(payload.error || "Unable to save migration queue database")
+      setMigrationQueueDatabaseConfigured(payload.settings?.queueDatabaseConfigured === true)
+      setMigrationQueueDatabaseSsl(payload.settings?.queueDatabaseSsl !== false)
+      setMigrationQueueDatabaseUrl("")
+      setMigrationQueueDatabaseMessage("Queue database saved. Each dispatched worker will retrieve its URI securely from the Migration Orchestrator at startup.")
+    } catch (error) {
+      setMigrationQueueDatabaseMessage(error instanceof Error ? error.message : String(error))
+    } finally { setMigrationQueueDatabaseBusy(false) }
+  }
 
   const saveMigrationOrchestratorSettings = async (worker: "migration" | "file") => {
     setMigrationOrchestratorBusy(true)
@@ -401,6 +432,21 @@ export default function DashboardSettingsPage() {
           </Button>
           <Button variant="outline" onClick={runOrchestratorNow} disabled={orchestratorBusy || !orchestratorLoaded || !orchestratorEnabled}>Run now</Button>
         </CardFooter>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Migration queue database</CardTitle>
+          <CardDescription>PostgreSQL used by migration workers for job claims, leases, per-file progress, results, and worker status. Each dispatched worker retrieves its URI securely from the Migration Orchestrator once at startup. For large pools, use your provider’s pooled connection URI because each running worker keeps one connection open.</CardDescription>
+          <CardAction><Badge variant={migrationQueueDatabaseConfigured ? "default" : "secondary"}>{migrationQueueDatabaseConfigured ? "Configured" : "Required for worker pools"}</Badge></CardAction>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="space-y-2"><Label htmlFor="migration-queue-database-url">PostgreSQL connection URI</Label><Input id="migration-queue-database-url" type="password" autoComplete="new-password" value={migrationQueueDatabaseUrl} disabled={migrationQueueDatabaseBusy} onChange={(event) => setMigrationQueueDatabaseUrl(event.target.value)} placeholder={migrationQueueDatabaseConfigured ? "Enter a replacement URI to rotate the queue database" : "postgresql://user:password@host/database?sslmode=require"} /></div>
+          <label htmlFor="migration-queue-database-ssl" className="flex items-start gap-3 rounded-md border p-3 text-sm"><input id="migration-queue-database-ssl" type="checkbox" checked={migrationQueueDatabaseSsl} disabled={migrationQueueDatabaseBusy} onChange={(event) => setMigrationQueueDatabaseSsl(event.target.checked)} /><span><span className="font-medium">Use SSL/TLS</span><span className="mt-1 block text-xs text-muted-foreground">Disable only when your PostgreSQL provider explicitly requires an unencrypted connection.</span></span></label>
+          {migrationQueueDatabaseMessage ? <p className="text-sm">{migrationQueueDatabaseMessage}</p> : null}
+          <p className="text-xs text-muted-foreground">Changing the URI or SSL mode affects newly dispatched runs. Let active migrations finish before switching.</p>
+        </CardContent>
+        <CardFooter><Button onClick={() => void saveMigrationQueueDatabase()} disabled={migrationQueueDatabaseBusy || (!migrationQueueDatabaseUrl.trim() && !migrationQueueDatabaseConfigured)}>{migrationQueueDatabaseBusy ? "Saving…" : "Save queue database"}</Button></CardFooter>
       </Card>
 
       <div className="hidden" aria-hidden="true">

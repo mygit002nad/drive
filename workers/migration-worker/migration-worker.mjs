@@ -10,12 +10,14 @@ import {
 } from "@aws-sdk/client-s3"
 import { Upload } from "@aws-sdk/lib-storage"
 import { createHash, randomUUID } from "crypto"
+import pg from "pg"
 import { mkdir, readFile, rename, writeFile } from "fs/promises"
 import os from "os"
 import path from "path"
 import { Transform } from "stream"
 
 class WorkerAuthenticationError extends Error {}
+class WorkerBootstrapTerminalError extends Error {}
 
 function getArg(name, fallback = "") {
   const index = process.argv.indexOf(`--${name}`)
@@ -24,6 +26,9 @@ function getArg(name, fallback = "") {
 }
 
 let SERVER_URL = String(getArg("server-url", "")).replace(/\/+$/, "")
+let QUEUE_DATABASE_URL = String(process.env.DRIVE_MIGRATION_QUEUE_DATABASE_URL || "").trim()
+let QUEUE_DATABASE_SSL = String(process.env.DRIVE_MIGRATION_QUEUE_SSL || "true").toLowerCase() !== "false"
+let QUEUE_GENERATION = Math.max(0, Math.trunc(Number(process.env.DRIVE_WORKER_GENERATION) || 0))
 let AGENT_ID = String(getArg("agent-id", "")).trim()
 let AGENT_TOKEN = String(getArg("token", ""))
 const MIGRATION_ID = String(getArg("migration-id", process.env.DRIVE_MIGRATION_ID || process.env.MIGRATION_ID || ""))
@@ -31,6 +36,7 @@ const REPAIR_JOB_ID = String(getArg("repair-job-id", process.env.DRIVE_REPAIR_JO
 const POOL_MODE = Boolean(MIGRATION_ID && !REPAIR_JOB_ID)
 const GITHUB_RUN_ID = String(process.env.GITHUB_RUN_ID || "")
 const WORKER_INSTANCE_ID = String(process.env.WORKER_INSTANCE_ID || GITHUB_RUN_ID || "").trim()
+const WORKER_STARTED_AT = new Date().toISOString()
 // GitHub-hosted jobs have a hard six-hour ceiling. Retire five minutes early
 // so the current file can be durably released and the run can close cleanly.
 const DEFAULT_MAX_RUNTIME_SECONDS = process.env.GITHUB_ACTIONS === "true" ? "21300" : "0"
@@ -60,7 +66,12 @@ const RANGE_COPY_THRESHOLD = Math.max(
   0,
   Math.min(1024 * 1024 * 1024, (Number.isFinite(RANGE_COPY_THRESHOLD_MB) ? RANGE_COPY_THRESHOLD_MB : 64) * 1024 * 1024)
 )
-const RANGE_COPY_CONCURRENCY = Math.max(1, Math.min(16, Number(getArg("range-copy-concurrency", String(UPLOAD_QUEUE_SIZE))) || UPLOAD_QUEUE_SIZE))
+// Large inventory objects are copied as independent ranged parts. GitHub
+// workers get a little more per-object parallelism so multi-GB files do not
+// sit behind a small four-part window; keep the part size unchanged to bound
+// memory and preserve resumable multipart checkpoints.
+const DEFAULT_RANGE_COPY_CONCURRENCY = process.env.GITHUB_ACTIONS === "true" ? "8" : String(UPLOAD_QUEUE_SIZE)
+const RANGE_COPY_CONCURRENCY = Math.max(1, Math.min(16, Number(getArg("range-copy-concurrency", DEFAULT_RANGE_COPY_CONCURRENCY)) || UPLOAD_QUEUE_SIZE))
 // Keep one heartbeat cycle well below the panel's stale-lease window. A
 // 60-second timeout with five retries can block for several minutes, causing
 // the orchestrator to requeue a live worker while it is still copying.
@@ -73,18 +84,71 @@ const jobUpdateQueues = new Map()
 const jobClaimTokens = new Map()
 let runtimeConfigurationLoadedAt = 0
 let fatalAuthenticationError = false
+function queueClientOptions() {
+  const connectionString = new URL(QUEUE_DATABASE_URL)
+  connectionString.searchParams.delete("sslmode")
+  return { connectionString: connectionString.toString(), ssl: QUEUE_DATABASE_SSL, connectionTimeoutMillis: 15_000, query_timeout: 15_000, keepAlive: true, application_name: "drive-migration-worker" }
+}
+let queueClient = QUEUE_DATABASE_URL ? new pg.Client(queueClientOptions()) : null
+let queueReady = false
+let queueOperation = Promise.resolve()
+
+async function withQueue(operation) {
+  if (!queueClient) throw new Error("Migration queue database is not configured")
+  const run = queueOperation.then(async () => {
+    if (!queueReady) {
+      await queueClient.end().catch(() => undefined)
+      queueClient = new pg.Client(queueClientOptions())
+      await queueClient.connect()
+      queueReady = true
+    }
+    try {
+      return await operation(queueClient)
+    } catch (error) {
+      queueReady = false
+      await queueClient.end().catch(() => undefined)
+      queueClient = new pg.Client(queueClientOptions())
+      throw error
+    }
+  })
+  queueOperation = run.catch(() => undefined)
+  return run
+}
+
+async function bootstrapQueueDatabase() {
+  if (queueClient || !SERVER_URL || !AGENT_ID || AGENT_TOKEN.length < 24 || !MIGRATION_ID) return
+  // Spread simultaneous GitHub starts across a short window so bootstrap and
+  // PostgreSQL connections do not arrive as a single burst.
+  await sleep(Math.floor(Math.random() * 5_000))
+  const response = await fetch(`${SERVER_URL}/workers/${encodeURIComponent(AGENT_ID)}/bootstrap`, {
+    method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ token: AGENT_TOKEN, migrationId: MIGRATION_ID, generation: QUEUE_GENERATION || undefined, workerInstanceId: WORKER_INSTANCE_ID }),
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (response.status === 401) throw new WorkerAuthenticationError(payload?.error || "Migration queue bootstrap authentication failed")
+  if (response.status === 409) throw new WorkerBootstrapTerminalError(payload?.error || "Migration is no longer active")
+  if (!response.ok || typeof payload?.queueDatabaseUrl !== "string") throw new Error(payload?.error || `Migration queue bootstrap failed with HTTP ${response.status}`)
+  const parsed = new URL(payload.queueDatabaseUrl)
+  if (!["postgres:", "postgresql:"].includes(parsed.protocol) || !parsed.hostname || !parsed.username || !parsed.password) throw new Error("Migration Orchestrator returned an invalid queue database URI")
+  QUEUE_DATABASE_URL = payload.queueDatabaseUrl
+  QUEUE_DATABASE_SSL = payload.queueDatabaseSsl !== false
+  QUEUE_GENERATION = Math.max(1, Math.trunc(Number(payload.generation) || 1))
+  queueClient = new pg.Client(queueClientOptions())
+}
 let runtimeRotationRequested = false
 let runtimeRotationTimer = null
 const WORKER_STATE_DIR = path.resolve(String(getArg("state-dir", path.join(process.cwd(), ".drive-worker"))))
 const WORKER_IDENTITY_PATH = path.join(WORKER_STATE_DIR, "identity.json")
 
-if (!SERVER_URL || AGENT_TOKEN.length < 24) {
-  console.error("Missing required configuration. Provide the Migration Orchestrator SERVER_URL and TOKEN (the common Migration Worker secret).")
+if ((!QUEUE_DATABASE_URL && (!SERVER_URL || AGENT_TOKEN.length < 24)) || (QUEUE_DATABASE_URL && !MIGRATION_ID)) {
+  console.error("Missing required configuration. Provide the migration queue database URL and migration id, or the legacy Orchestrator URL and token.")
   process.exit(1)
 }
 
 async function loadRuntimeConfiguration(force = false) {
   if (!force && runtimeConfigurationLoadedAt > Date.now() - 60_000) return
+  if (QUEUE_DATABASE_URL) return
   if (!SERVER_URL || AGENT_TOKEN.length < 24) throw new Error("SERVER_URL and the common Migration Worker secret are required")
   runtimeConfigurationLoadedAt = Date.now()
 }
@@ -370,6 +434,39 @@ async function api(path, body, options = {}) {
 }
 
 async function heartbeat(extra = {}) {
+  if (queueClient) return withQueue(async (db) => {
+    const migrationId = MIGRATION_ID
+    if (!migrationId || !WORKER_INSTANCE_ID) throw new Error("Queue worker identity or migration scope is missing")
+    const meta = (await db.query(`select generation,status from drive_migration_queue_meta where migration_id=$1 and ($2::int=0 or generation=$2) order by generation desc limit 1`, [migrationId, QUEUE_GENERATION])).rows[0]
+    if (!meta) throw new Error("Migration queue has not been initialized")
+    if (meta.status === "superseded") {
+      if (currentJobId) markJobAborted(currentJobId)
+      throw new JobAbortedError()
+    }
+    QUEUE_GENERATION = Number(meta.generation)
+    await db.query(`insert into drive_migration_queue_workers(worker_instance_id,agent_id,migration_id,generation,status,current_job_id,metadata,last_heartbeat_at,updated_at)
+      values($1,$2,$3,$4,'online',$5,jsonb_build_object('workerStartedAt',$7::timestamptz,'runtimeAccountingVersion',1)||$6::jsonb,now(),now())
+      on conflict(worker_instance_id) do update set status='online',current_job_id=excluded.current_job_id,
+        runtime_seconds=drive_migration_queue_workers.runtime_seconds+case when drive_migration_queue_workers.status='online' then greatest(0,floor(extract(epoch from(now()-drive_migration_queue_workers.last_heartbeat_at)))::bigint) else 0 end,
+        metadata=case when drive_migration_queue_workers.metadata ? 'workerStartedAt' then drive_migration_queue_workers.metadata||(excluded.metadata-'workerStartedAt')
+          else jsonb_build_object('workerStartedAt',$7::timestamptz)||drive_migration_queue_workers.metadata||(excluded.metadata-'workerStartedAt') end,
+        last_heartbeat_at=now(),updated_at=now()`,
+      [WORKER_INSTANCE_ID, AGENT_ID || null, migrationId, meta.generation, currentJobId, JSON.stringify(extra), WORKER_STARTED_AT])
+    if (currentJobId) {
+      const claimToken = jobClaimTokens.get(currentJobId)
+      const renewed = await db.query(`update drive_migration_queue_jobs set lease_expires_at=now()+interval '3 minutes',last_heartbeat_at=now(),updated_at=now()
+        where id=$1 and claimed_by=$2 and claim_token=$3::uuid and status in('claimed','running') returning id`, [currentJobId, WORKER_INSTANCE_ID, claimToken || null])
+      if (!renewed.rowCount) {
+        const row = (await db.query(`select status from drive_migration_queue_jobs where id=$1`, [currentJobId])).rows[0]
+        if (row?.status === "canceled") {
+          markJobAborted(currentJobId)
+          throw new JobAbortedError()
+        }
+        throw new Error("This migration queue job is no longer owned by this worker")
+      }
+    }
+    return { ok: true }
+  })
   await loadRuntimeConfiguration()
   const result = await api(`/workers/${encodeURIComponent(AGENT_ID)}/heartbeat`, {
     token: AGENT_TOKEN,
@@ -388,6 +485,9 @@ async function heartbeat(extra = {}) {
 
 async function retireWorker(reason) {
   if (!WORKER_INSTANCE_ID) return
+  if (queueClient) return withQueue((db) => db.query(`update drive_migration_queue_workers set
+    runtime_seconds=runtime_seconds+case when status='online' then greatest(0,floor(extract(epoch from(now()-last_heartbeat_at)))::bigint) else 0 end,
+    status='offline',current_job_id=null,metadata=metadata||$2::jsonb,updated_at=now() where worker_instance_id=$1`, [WORKER_INSTANCE_ID, JSON.stringify({ retireReason: reason, retiredAt: new Date().toISOString(), runtimeAccountingVersion: 1 })]))
   await api(`/workers/${encodeURIComponent(AGENT_ID)}/retire`, {
     token: AGENT_TOKEN,
     workerInstanceId: WORKER_INSTANCE_ID,
@@ -415,6 +515,44 @@ async function releaseJobForRotation(jobId) {
 }
 
 async function claimJob() {
+  if (queueClient) return withQueue(async (db) => {
+    if (!MIGRATION_ID || !WORKER_INSTANCE_ID) throw new Error("Migration queue claims require migration id and worker instance id")
+    await db.query("begin")
+    try {
+      const meta = (await db.query(`select generation,status,seed_complete,execution_config from drive_migration_queue_meta where migration_id=$1 and ($2::int=0 or generation=$2) order by generation desc limit 1 for share`, [MIGRATION_ID, QUEUE_GENERATION])).rows[0]
+      if (!meta || ["canceled", "completed", "failed", "verification_failed", "aborted", "superseded"].includes(String(meta.status))) {
+        await db.query("commit")
+        return { ok: true, job: null, poolComplete: true, poolStatus: meta?.status || "missing" }
+      }
+      QUEUE_GENERATION = Number(meta.generation)
+      const candidate = await db.query(`select id,payload,progress,result,status from drive_migration_queue_jobs
+        where migration_id=$1 and generation=$2 and (status='pending' or (status in('claimed','running') and lease_expires_at<now()))
+        order by created_at,id for update skip locked limit 1`, [MIGRATION_ID, meta.generation])
+      if (!candidate.rowCount) {
+        const counts = await db.query(`select count(*) filter(where status in('pending','claimed','running')) remaining from drive_migration_queue_jobs where migration_id=$1 and generation=$2`, [MIGRATION_ID, meta.generation])
+        const complete = meta.seed_complete === true && Number(counts.rows[0]?.remaining || 0) === 0
+        await db.query("commit")
+        return { ok: true, job: null, poolComplete: complete, poolReason: complete ? "terminal" : "queue_empty_or_seeding" }
+      }
+      const selected = candidate.rows[0]
+      const claimToken = randomUUID()
+      const claimed = await db.query(`update drive_migration_queue_jobs set status='running',claimed_by=$2,agent_id=$4::uuid,claim_token=$3::uuid,attempts=attempts+1,
+        lease_expires_at=now()+interval '3 minutes',last_heartbeat_at=now(),updated_at=now()
+        where id=$1 returning id,migration_id,generation,payload,progress,result,claim_token,status`, [selected.id, WORKER_INSTANCE_ID, claimToken, validUuid(AGENT_ID) ? AGENT_ID : null])
+      await db.query(`insert into drive_migration_queue_workers(worker_instance_id,agent_id,migration_id,generation,status,current_job_id,metadata,last_heartbeat_at,updated_at)
+        values($1,$2,$3,$4,'online',$5,jsonb_build_object('workerStartedAt',$6::timestamptz,'runtimeAccountingVersion',1),now(),now())
+        on conflict(worker_instance_id) do update set status='online',current_job_id=excluded.current_job_id,
+          runtime_seconds=drive_migration_queue_workers.runtime_seconds+case when drive_migration_queue_workers.status='online' then greatest(0,floor(extract(epoch from(now()-drive_migration_queue_workers.last_heartbeat_at)))::bigint) else 0 end,
+          metadata=case when drive_migration_queue_workers.metadata ? 'workerStartedAt' then drive_migration_queue_workers.metadata
+            else drive_migration_queue_workers.metadata||excluded.metadata end,last_heartbeat_at=now(),updated_at=now()`,
+        [WORKER_INSTANCE_ID, AGENT_ID || null, MIGRATION_ID, meta.generation, selected.id, WORKER_STARTED_AT])
+      await db.query("commit")
+      const row = claimed.rows[0]
+      jobClaimTokens.set(row.id, row.claim_token)
+      const payload = { ...row.payload, ...(meta.execution_config || {}) }
+      return { ok: true, job: { id: row.id, migrationId: row.migration_id, mode: "migration", claimToken: row.claim_token, status: row.status }, payload }
+    } catch (error) { await db.query("rollback").catch(() => undefined); throw error }
+  })
   await loadRuntimeConfiguration()
   if (!MIGRATION_ID) throw new Error("Migration Orchestrator claim requires migrationId")
   const claimed = await api(`/workers/${encodeURIComponent(AGENT_ID)}/claim-job`, {
@@ -430,6 +568,26 @@ async function claimJob() {
 }
 
 async function updateJob(jobId, body, options = {}) {
+  if (queueClient) return withQueue(async (db) => {
+    const claimToken = jobClaimTokens.get(jobId)
+    const status = String(body.status || "running")
+    const released = status === "pending"
+    const terminal = ["completed", "failed", "canceled"].includes(status)
+    const result = await db.query(`update drive_migration_queue_jobs set status=$4,progress=coalesce(progress,'{}'::jsonb)||$5::jsonb,
+      result=coalesce(result,'{}'::jsonb)||$6::jsonb,summary=coalesce($7,summary),error=case when $8 then null else coalesce($9,error) end,
+      claimed_by=case when $10 then null else claimed_by end,agent_id=case when $10 then null else agent_id end,claim_token=case when $10 then null else claim_token end,
+      lease_expires_at=case when $10 then null when $11 then null else now()+interval '3 minutes' end,
+      last_heartbeat_at=case when $10 then null else now() end,completed_at=case when $11 then now() when $10 then null else completed_at end,updated_at=now()
+      where id=$1 and claimed_by=$2 and claim_token=$3::uuid and status in('claimed','running','pending') returning id,status`,
+      [jobId, WORKER_INSTANCE_ID, claimToken || null, status, JSON.stringify(body.progress || {}), JSON.stringify(body.result || {}), typeof body.summary === "string" ? body.summary.slice(0, 2000) : null, released, typeof body.error === "string" ? body.error.slice(0, 4000) : null, released, terminal])
+    if (!result.rowCount) {
+      const current = (await db.query(`select status from drive_migration_queue_jobs where id=$1`, [jobId])).rows[0]
+      if (current?.status === "canceled") return { ok: true, canceled: true }
+      throw new Error("This job is no longer owned by this worker")
+    }
+    if (terminal || released) jobClaimTokens.delete(jobId)
+    return { ok: true, job: result.rows[0] }
+  })
   const allowOffline = options?.allowOffline === true
   let response
   try {
@@ -2016,16 +2174,22 @@ async function runJob(job, payload) {
 let currentJobId = null
 let heartbeatLoopStarted = false
 let heartbeatLoopStopped = false
+let currentLeaseConfirmedAt = 0
 
 async function startHeartbeatLoop() {
   while (!heartbeatLoopStopped) {
     try {
       await heartbeat({ currentJobId: currentJobId ?? null })
+      if (currentJobId) currentLeaseConfirmedAt = Date.now()
     } catch (error) {
       if (error instanceof WorkerAuthenticationError) {
         fatalAuthenticationError = true
         console.error("Worker authentication failed:", error.message)
         stopHeartbeatLoop()
+      }
+      if (currentJobId && Date.now() - currentLeaseConfirmedAt > 60_000) {
+        console.error(`Queue lease could not be renewed for ${currentJobId}; aborting work before the lease can expire`)
+        markJobAborted(currentJobId)
       }
       console.error("Heartbeat failed:", error instanceof Error ? error.message : String(error))
     }
@@ -2038,9 +2202,9 @@ function stopHeartbeatLoop() {
 }
 
 async function main() {
-  console.log(`Worker starting for agent ${AGENT_ID} at ${SERVER_URL}`)
+  console.log(`Worker starting for agent ${AGENT_ID} using ${queueClient ? "the migration queue database" : SERVER_URL}`)
   console.log(
-    `Copy tuning: ${COPY_CONCURRENCY} object(s) in parallel, ${UPLOAD_QUEUE_SIZE} upload part(s) per object, ${Math.round(UPLOAD_PART_SIZE / 1024 / 1024)} MB parts`
+    `Copy tuning: ${COPY_CONCURRENCY} object(s) in parallel, ${RANGE_COPY_CONCURRENCY} ranged part(s) per large object, ${UPLOAD_QUEUE_SIZE} upload part(s) per streamed object, ${Math.round(UPLOAD_PART_SIZE / 1024 / 1024)} MB parts`
   )
   if (!heartbeatLoopStarted) {
     heartbeatLoopStarted = true
@@ -2078,11 +2242,13 @@ async function main() {
 
       idleClaimCount = 0
       currentJobId = claimed.job.id
+      currentLeaseConfirmedAt = Date.now()
       jobAbortControllers.set(claimed.job.id, new AbortController())
       console.log(`Claimed job ${claimed.job.id} for migration ${claimed.payload?.migration?.id || "-"}`)
       await runJob(claimed.job, claimed.payload)
       console.log(`Finished job ${claimed.job.id}`)
       currentJobId = null
+      currentLeaseConfirmedAt = 0
       jobAbortControllers.delete(claimed.job.id)
       if (runtimeRotationRequested || Date.now() >= RUNTIME_DEADLINE) {
         runtimeRotationRequested = true
@@ -2130,6 +2296,7 @@ async function main() {
         }
       }
       currentJobId = null
+      currentLeaseConfirmedAt = 0
       if (failedJobId) jobAbortControllers.delete(failedJobId)
       if (EXIT_AFTER_JOB && failedJobId) {
         console.log(`Exit-after-job enabled; stopping worker after terminal job ${failedJobId}`)
@@ -2146,6 +2313,7 @@ async function runWorkerForever() {
     try {
       await loadRuntimeConfiguration()
       await ensureWorkerIdentity()
+      await bootstrapQueueDatabase()
       await main()
       return
     } catch (error) {
@@ -2156,7 +2324,18 @@ async function runWorkerForever() {
         process.exitCode = 1
         return
       }
+      if (error instanceof WorkerBootstrapTerminalError) {
+        console.log(`Worker pool bootstrap finished: ${error.message}`)
+        stopHeartbeatLoop()
+        return
+      }
       currentJobId = null
+      currentLeaseConfirmedAt = 0
+      if (Date.now() >= RUNTIME_DEADLINE) {
+        console.error("Worker startup retries reached the configured runtime window")
+        stopHeartbeatLoop()
+        return
+      }
       if (EXIT_AFTER_JOB) {
         stopHeartbeatLoop()
         return
@@ -2174,4 +2353,6 @@ process.on("uncaughtException", (error) => {
   console.error("Uncaught exception:", error instanceof Error ? error.stack || error.message : String(error))
 })
 
-void runWorkerForever()
+void runWorkerForever().finally(async () => {
+  if (queueClient && queueReady) await queueClient.end().catch(() => undefined)
+})

@@ -83,6 +83,15 @@ export default function DashboardLayout({
         return [...base, { label: "Migrations", href: "/dashboard/migrations" }, { label: "History" }]
       }
 
+      if (parts[3] === "worker-pool") {
+        return [
+          ...base,
+          { label: "Migrations", href: "/dashboard/migrations" },
+          { label: "Migration", href: `/dashboard/migrations/${encodeURIComponent(sub)}` },
+          { label: "Worker pool" },
+        ]
+      }
+
       // /dashboard/migrations/[id]
       return [...base, { label: "Migrations", href: "/dashboard/migrations" }, { label: sub }]
     }

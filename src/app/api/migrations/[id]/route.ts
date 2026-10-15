@@ -3,6 +3,8 @@ import { deleteMigration, getMigration, getMigrationDetailBootstrap } from "@/li
 import { requireAdmin } from "@/lib/server-auth"
 import { getMigrationReadOnlyState } from "@/lib/migration-read-only"
 import { getRequestActivityContext, recordActivity } from "@/lib/activity-store"
+import { getMigrationWorkerSettings } from "@/lib/migration-worker-settings-store"
+import { readMigrationQueueLiveProjection } from "@/lib/migration-queue-database"
 
 export async function GET(
   _request: Request,
@@ -17,11 +19,33 @@ export async function GET(
     if (!bootstrap) {
       return NextResponse.json({ error: "Migration not found" }, { status: 404 })
     }
-    const { migration, items, workerRuns, accounts } = bootstrap
+    let { migration, items, workerRuns } = bootstrap
+    const { accounts } = bootstrap
+    let workerPoolLiveStats: Record<string, number> | null = null
+    if (migration?.options?.executionMode === "migration_workers") {
+      const settings = await getMigrationWorkerSettings()
+      if (settings.queueDatabaseUrl) {
+        const generation = Math.max(0, Number(migration.options.workerGeneration || 0))
+        try {
+          const live = await readMigrationQueueLiveProjection(settings.queueDatabaseUrl, settings.queueDatabaseSsl, id, generation)
+          if (live) {
+            items = items.map((item) => {
+              const current = live.items.find((entry) => entry.id === item.id)
+              return current ? { ...item, slurperStatus: current.slurperStatus, progress: { ...item.progress, live: current.progress.live }, updatedAt: current.progress.live.updatedAt || item.updatedAt } : item
+            })
+            workerRuns = live.workerRuns
+            migration = { ...migration, status: live.migrationStatus, options: { ...migration.options, workerPoolLiveStats: live.stats } }
+            workerPoolLiveStats = live.stats
+          }
+        } catch {
+          // Keep the saved primary-database projection available during queue-database outages.
+        }
+      }
+    }
     // Read the persisted migration projection. Synchronization is owned by the
     // orchestrator and must not delay every page/detail read.
     const readOnly = getMigrationReadOnlyState(migration)
-    return NextResponse.json({ migration, items, workerRuns, accounts, historyReadOnly: readOnly }, { status: 200 })
+    return NextResponse.json({ migration, items, workerRuns, accounts, workerPoolLiveStats, historyReadOnly: readOnly }, { status: 200 })
   } catch (error: unknown) {
     const message =
       typeof error === "object" && error !== null && "message" in error

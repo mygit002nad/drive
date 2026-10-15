@@ -731,6 +731,10 @@ async function selectNextAccount(db: Client, syncIntervalMinutes: number) {
     where api_token<>''
       and status in('active','available')
       and (last_synced_at is null or last_synced_at < now() - ($1::text || ' minutes')::interval)
+      -- An incomplete sync keeps last_synced_at at its last successful value.
+      -- Cool down recently attempted accounts so an older available account
+      -- with missing analytics cannot starve the active account every minute.
+      and (coalesce(sync_status,'')<>'syncing' or updated_at < now()-interval '5 minutes')
     order by last_synced_at asc nulls first,
              created_at asc limit 1
   `, [syncIntervalMinutes])

@@ -11,6 +11,8 @@ import { abortRepairJob, deleteRepairJob, getRepairJob, getRepairJobDetail } fro
 import { requireAdmin } from "@/lib/server-auth"
 import { recordUserActivity } from "@/lib/activity-audit"
 import { queryDb } from "@/lib/db"
+import { getMigrationWorkerSettings } from "@/lib/migration-worker-settings-store"
+import { withMigrationQueueDatabase } from "@/lib/migration-queue-database"
 
 function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback
@@ -128,6 +130,28 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
     if (!auth.ok) return auth.response
 
     const { id } = await context.params
+    if (/^[0-9a-f-]{36}$/i.test(id)) {
+      const settings = await getMigrationWorkerSettings()
+      if (settings.queueDatabaseUrl) {
+        const queued = await withMigrationQueueDatabase(settings.queueDatabaseUrl, async (db) => db.query(`
+          select id,migration_id,status,payload,progress,result,summary,error,agent_id,claimed_by,created_at,updated_at,completed_at,last_heartbeat_at
+          from drive_migration_queue_jobs where id=$1 limit 1
+        `, [id]), settings.queueDatabaseSsl)
+        const row = queued.rows[0]
+        if (row) {
+          const sourcePayload = row.payload && typeof row.payload === "object" ? row.payload : {}
+          const safePayload = {
+            job: sourcePayload.job || {}, migration: sourcePayload.migration || {},
+            items: Array.isArray(sourcePayload.items) ? sourcePayload.items.map((item: Record<string, unknown>) => ({
+              id: item.id, sourceBucket: item.sourceBucket, targetBucket: item.targetBucket,
+              sourceObjects: item.sourceObjects, sourceBytes: item.sourceBytes, progress: item.progress,
+            })) : [],
+            ...(Array.isArray(sourcePayload.inventoryObjects) ? { inventoryObjects: sourcePayload.inventoryObjects } : {}),
+          }
+          return NextResponse.json({ job: { id: row.id, migrationId: row.migration_id, mode: safePayload.job?.mode || "migration", status: row.status, claimedByAgentId: row.agent_id || row.claimed_by, payload: safePayload, progress: row.progress || {}, result: row.result || {}, summary: row.summary, error: row.error, createdAt: row.created_at, updatedAt: row.updated_at, completedAt: row.completed_at, lastHeartbeatAt: row.last_heartbeat_at, linkedRun: null } }, { headers: { "Cache-Control": "no-store, max-age=0" } })
+        }
+      }
+    }
     const detail = await getRepairJobDetail(id)
     if (!detail) return NextResponse.json({ error: "Repair job not found" }, { status: 404 })
     return NextResponse.json({ job: { ...detail.job, linkedRun: detail.linkedRun } })

@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server"
 import { getMigrationDetailBootstrap } from "@/lib/migrations-store"
 import { requireAdmin } from "@/lib/server-auth"
+import { getMigrationWorkerSettings } from "@/lib/migration-worker-settings-store"
+import { readMigrationQueueLiveProjection } from "@/lib/migration-queue-database"
 
 export const runtime = "nodejs"
 
@@ -52,6 +54,11 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
   if (!auth.ok) return auth.response
 
   const { id } = await context.params
+  const bootstrap = await getCachedStreamSnapshot(id)
+  const queueSettings = bootstrap?.migration?.options?.executionMode === "migration_workers"
+    ? await getMigrationWorkerSettings()
+    : null
+  const directQueue = queueSettings?.queueDatabaseUrl ? { url: queueSettings.queueDatabaseUrl, ssl: queueSettings.queueDatabaseSsl } : null
 
   const encoder = new TextEncoder()
 
@@ -95,14 +102,29 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
         // The stream only projects saved PostgreSQL state; worker schedules
         // advance migrations independently of any connected dashboard.
         while (!closed && !request.signal.aborted) {
-          let nextDelay = 10_000
+          let nextDelay = 30_000
           try {
-            const bootstrap = await getCachedStreamSnapshot(id)
-            if (!bootstrap) {
+            const currentBootstrap = await getCachedStreamSnapshot(id)
+            if (!currentBootstrap) {
               send("error", { error: "Migration not found" })
               break
             }
-            const { migration, items, workerRuns } = bootstrap
+            let { migration, items, workerRuns } = currentBootstrap
+            if (directQueue) {
+              try {
+                const live = await readMigrationQueueLiveProjection(directQueue.url, directQueue.ssl, id, Math.max(0, Number(migration.options.workerGeneration || 0)))
+                if (live) {
+                  items = items.map((item) => {
+                    const current = live.items.find((entry) => entry.id === item.id)
+                    return current ? { ...item, slurperStatus: current.slurperStatus, progress: { ...item.progress, live: current.progress.live }, updatedAt: current.progress.live.updatedAt || item.updatedAt } : item
+                  })
+                  workerRuns = live.workerRuns
+                  migration = { ...migration, status: live.migrationStatus, options: { ...migration.options, workerPoolLiveStats: live.stats } }
+                }
+              } catch {
+                // Fall back to the last Orchestrator projection if the queue database is briefly unreachable.
+              }
+            }
             const snapshot = { migration, items, workerRuns }
             const serialized = JSON.stringify(snapshot)
             const now = Date.now()
@@ -113,7 +135,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
             } else {
               safeEnqueue(encoder.encode(": keepalive\n\n"))
             }
-            nextDelay = ["running", "verifying", "queued"].includes(migration.status) ? 4_000 : 15_000
+            nextDelay = directQueue ? 30_000 : ["running", "verifying", "queued"].includes(migration.status) ? 10_000 : 30_000
           } catch (e: unknown) {
             const message =
               typeof e === "object" && e !== null && "message" in e

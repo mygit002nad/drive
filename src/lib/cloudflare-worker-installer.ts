@@ -340,6 +340,35 @@ async function ensureQueue(token: string, accountId: string, name: string) {
   return existing || cf<{ queue_id: string; queue_name: string }>(token, `/accounts/${accountId}/queues`, { method: "POST", body: JSON.stringify({ queue_name: name }) })
 }
 
+async function removeWorkerQueueConsumer(token: string, accountId: string, worker: HostedWorker, scriptName: string) {
+  if (worker === "backend") return
+  // Find consumers by the actual script binding, not by the currently
+  // configured queue name. The installation suffix can change if APP_URL
+  // changes, and Cloudflare refuses script deletion while any Queue points at
+  // it. Queue listings are paginated, so inspect every page.
+  const queues: Array<{ queue_id: string; queue_name: string }> = []
+  for (let page = 1; ; page += 1) {
+    const pageQueues = await cf<Array<{ queue_id: string; queue_name: string }>>(token, `/accounts/${accountId}/queues?per_page=100&page=${page}`)
+    queues.push(...pageQueues)
+    if (pageQueues.length < 100) break
+  }
+
+  for (const queue of queues) {
+    const consumers = queueConsumers(await cf<QueueConsumer[] | { consumers?: QueueConsumer[] }>(token, `/accounts/${accountId}/queues/${queue.queue_id}/consumers`))
+    for (const consumer of consumers.filter((candidate) => candidate.script_name === scriptName)) {
+      if (!consumer.consumer_id) throw new Error(`Queue ${queue.queue_name} has a consumer for ${scriptName} without an identifier`)
+      await cf(token, `/accounts/${accountId}/queues/${queue.queue_id}/consumers/${consumer.consumer_id}`, { method: "DELETE" })
+    }
+  }
+
+  const stillAttached: string[] = []
+  for (const queue of queues) {
+    const consumers = queueConsumers(await cf<QueueConsumer[] | { consumers?: QueueConsumer[] }>(token, `/accounts/${accountId}/queues/${queue.queue_id}/consumers`))
+    if (consumers.some((consumer) => consumer.script_name === scriptName)) stillAttached.push(queue.queue_name)
+  }
+  if (stillAttached.length) throw new Error(`Cannot delete ${scriptName}; it remains attached to Queue consumer(s): ${stillAttached.join(", ")}`)
+}
+
 async function ensureHyperdrive(token: string, accountId: string, state: InstallState) {
   const postgresUrl = String(process.env.POSTGRES_URL || "").trim()
   let parsed: URL
@@ -626,6 +655,7 @@ export async function deleteCloudflareWorkers() {
         current.phase = "deleting"; state.step = `${worker}_deleting`; await saveState(state)
         if (current.accountId && state.encryptedTokens?.[worker]) {
           const token = decryptToken(state.encryptedTokens[worker]!, state.id, worker)
+          await removeWorkerQueueConsumer(token, current.accountId, worker, current.scriptName)
           await deleteWorkerScript(token, current.accountId, current.scriptName)
         }
         state.workers[worker] = { scriptName: current.scriptName, phase: "queued" }
