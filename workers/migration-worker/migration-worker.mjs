@@ -92,12 +92,34 @@ function queueClientOptions() {
 let queueClient = QUEUE_DATABASE_URL ? new pg.Client(queueClientOptions()) : null
 let queueReady = false
 let queueOperation = Promise.resolve()
+let queueIdleTimer = null
+const QUEUE_CONNECTION_IDLE_MS = Math.max(1_000, Number(process.env.QUEUE_CONNECTION_IDLE_MS || 5_000))
+
+function releaseQueueConnectionAfterIdle() {
+  if (queueIdleTimer) clearTimeout(queueIdleTimer)
+  queueIdleTimer = setTimeout(() => {
+    queueIdleTimer = null
+    const release = queueOperation.then(async () => {
+      if (!queueReady || !queueClient) return
+      const idleClient = queueClient
+      queueClient = null
+      queueReady = false
+      await idleClient.end().catch(() => undefined)
+    })
+    queueOperation = release.catch(() => undefined)
+  }, QUEUE_CONNECTION_IDLE_MS)
+  queueIdleTimer.unref?.()
+}
 
 async function withQueue(operation) {
-  if (!queueClient) throw new Error("Migration queue database is not configured")
+  if (!QUEUE_DATABASE_URL) throw new Error("Migration queue database is not configured")
   const run = queueOperation.then(async () => {
+    if (queueIdleTimer) {
+      clearTimeout(queueIdleTimer)
+      queueIdleTimer = null
+    }
     if (!queueReady) {
-      await queueClient.end().catch(() => undefined)
+      await queueClient?.end().catch(() => undefined)
       queueClient = new pg.Client(queueClientOptions())
       await queueClient.connect()
       queueReady = true
@@ -109,6 +131,8 @@ async function withQueue(operation) {
       await queueClient.end().catch(() => undefined)
       queueClient = new pg.Client(queueClientOptions())
       throw error
+    } finally {
+      releaseQueueConnectionAfterIdle()
     }
   })
   queueOperation = run.catch(() => undefined)
@@ -434,7 +458,10 @@ async function api(path, body, options = {}) {
 }
 
 async function heartbeat(extra = {}) {
-  if (queueClient) return withQueue(async (db) => {
+  // The client is intentionally closed after a short idle period. Keep using
+  // the direct queue path based on configuration so each heartbeat reconnects
+  // to Neon instead of silently falling back to the panel database/API.
+  if (QUEUE_DATABASE_URL) return withQueue(async (db) => {
     const migrationId = MIGRATION_ID
     if (!migrationId || !WORKER_INSTANCE_ID) throw new Error("Queue worker identity or migration scope is missing")
     const meta = (await db.query(`select generation,status from drive_migration_queue_meta where migration_id=$1 and ($2::int=0 or generation=$2) order by generation desc limit 1`, [migrationId, QUEUE_GENERATION])).rows[0]
@@ -485,7 +512,7 @@ async function heartbeat(extra = {}) {
 
 async function retireWorker(reason) {
   if (!WORKER_INSTANCE_ID) return
-  if (queueClient) return withQueue((db) => db.query(`update drive_migration_queue_workers set
+  if (QUEUE_DATABASE_URL) return withQueue((db) => db.query(`update drive_migration_queue_workers set
     runtime_seconds=runtime_seconds+case when status='online' then greatest(0,floor(extract(epoch from(now()-last_heartbeat_at)))::bigint) else 0 end,
     status='offline',current_job_id=null,metadata=metadata||$2::jsonb,updated_at=now() where worker_instance_id=$1`, [WORKER_INSTANCE_ID, JSON.stringify({ retireReason: reason, retiredAt: new Date().toISOString(), runtimeAccountingVersion: 1 })]))
   await api(`/workers/${encodeURIComponent(AGENT_ID)}/retire`, {
@@ -515,7 +542,7 @@ async function releaseJobForRotation(jobId) {
 }
 
 async function claimJob() {
-  if (queueClient) return withQueue(async (db) => {
+  if (QUEUE_DATABASE_URL) return withQueue(async (db) => {
     if (!MIGRATION_ID || !WORKER_INSTANCE_ID) throw new Error("Migration queue claims require migration id and worker instance id")
     await db.query("begin")
     try {
@@ -568,7 +595,7 @@ async function claimJob() {
 }
 
 async function updateJob(jobId, body, options = {}) {
-  if (queueClient) return withQueue(async (db) => {
+  if (QUEUE_DATABASE_URL) return withQueue(async (db) => {
     const claimToken = jobClaimTokens.get(jobId)
     const status = String(body.status || "running")
     const released = status === "pending"
@@ -798,7 +825,7 @@ async function hashObject(client, bucket, key, abortSignal) {
   } finally { closeBodyStream(body) }
 }
 
-async function inspectAssignedObjects(sourceClient, targetClient, sourceBucket, targetBucket, objects, abortSignal) {
+async function inspectAssignedObjects(sourceClient, targetClient, sourceBucket, targetBucket, objects, abortSignal, verifyEqualSizeContent = true) {
   const found = []
   await runConcurrent(objects, Math.min(2, COPY_CONCURRENCY), async (object) => {
     let targetHead
@@ -810,6 +837,15 @@ async function inspectAssignedObjects(sourceClient, targetClient, sourceBucket, 
     }
     const actualSize = typeof targetHead.ContentLength === "number" ? targetHead.ContentLength : -1
     if (actualSize !== Number(object.size)) { found.push({ key: object.key, size: actualSize }); return }
+    // Overwrite migrations copy every assigned source object regardless of
+    // whether the destination already has a same-sized object. Hashing both
+    // full bodies here only delays the copy; final bucket verification checks
+    // content after transfer. Preserve full hashing when overwrite is off so
+    // exact matches can still be safely skipped.
+    if (!verifyEqualSizeContent) {
+      found.push({ key: object.key, size: actualSize, destinationSize: actualSize, destinationEtag: typeof targetHead.ETag === "string" ? targetHead.ETag.replace(/^"|"$/g, "") : null })
+      return
+    }
     const [sourceSha256, destinationSha256] = await Promise.all([
       hashObject(sourceClient, sourceBucket, object.key, abortSignal),
       hashObject(targetClient, targetBucket, object.key, abortSignal),
@@ -1321,7 +1357,13 @@ async function processItem(jobId, payload, item, completedResults, state) {
       syncLiveProgress()
     })
     const allDestinationObjects = assignedInventory
-      ? await inspectAssignedObjects(sourceClient, targetClient, item.sourceBucket, item.targetBucket, assignedInventory, getJobAbortSignal(jobId))
+      ? overwrite
+        // Overwrite mode copies every assigned source object. A destination
+        // HEAD (or content hash) per file adds no decision value here and can
+        // keep large buckets in repair_scan for hours. The final bucket
+        // verification checks the destination after all copies finish.
+        ? []
+        : await inspectAssignedObjects(sourceClient, targetClient, item.sourceBucket, item.targetBucket, assignedInventory, getJobAbortSignal(jobId), true)
       : await listAllObjects(targetClient, item.targetBucket, prefix, ({ count, key, size }) => {
       const delta = Math.max(0, count - destinationScanLastCount)
       destinationScanLastCount = count
@@ -1355,7 +1397,9 @@ async function processItem(jobId, payload, item, completedResults, state) {
     const shardSourceBytes = sourceObjects.reduce((sum, object) => sum + Number(object?.size || 0), 0)
     sourceObjectCount = allSourceObjects.length
     const shardObjectCount = sourceObjects.length
-    const initialDiff = diffObjectsByListing(sourceObjects, destinationObjects, ({ checked, key, size, missing, mismatched }) => {
+    const initialDiff = overwrite
+      ? { missing: [], mismatched: [] }
+      : diffObjectsByListing(sourceObjects, destinationObjects, ({ checked, key, size, missing, mismatched }) => {
       state.currentFile = {
         itemId: item.id,
         bucket: item.sourceBucket,
@@ -1413,7 +1457,9 @@ async function processItem(jobId, payload, item, completedResults, state) {
       processedFiles: transferred + failed + skipped,
       summary: `Scan complete for ${item.sourceBucket}${shardLabel}: ${alreadyPresent} already verified, ${initialMissing} missing, ${initialMismatched} mismatched`,
     })
-    pushLog(state, `Scan complete for ${item.sourceBucket}`, {
+    pushLog(state, overwrite
+      ? `Skipping destination pre-scan for ${item.sourceBucket}; overwrite will copy all source objects`
+      : `Scan complete for ${item.sourceBucket}`, {
       itemId: item.id,
       stage,
       alreadyPresent,
@@ -2202,7 +2248,7 @@ function stopHeartbeatLoop() {
 }
 
 async function main() {
-  console.log(`Worker starting for agent ${AGENT_ID} using ${queueClient ? "the migration queue database" : SERVER_URL}`)
+  console.log(`Worker starting for agent ${AGENT_ID} using ${QUEUE_DATABASE_URL ? "the migration queue database" : SERVER_URL}`)
   console.log(
     `Copy tuning: ${COPY_CONCURRENCY} object(s) in parallel, ${RANGE_COPY_CONCURRENCY} ranged part(s) per large object, ${UPLOAD_QUEUE_SIZE} upload part(s) per streamed object, ${Math.round(UPLOAD_PART_SIZE / 1024 / 1024)} MB parts`
   )
@@ -2354,5 +2400,6 @@ process.on("uncaughtException", (error) => {
 })
 
 void runWorkerForever().finally(async () => {
+  if (queueIdleTimer) clearTimeout(queueIdleTimer)
   if (queueClient && queueReady) await queueClient.end().catch(() => undefined)
 })

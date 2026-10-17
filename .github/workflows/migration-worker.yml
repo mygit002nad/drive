@@ -47,21 +47,22 @@ jobs:
 
       - name: Validate worker configuration
         env:
-          SERVER_URL: ${{ secrets.DRIVE_MIGRATION_ORCHESTRATOR_URL }}
-          TOKEN: ${{ secrets.DRIVE_WORKER_SHARED_SECRET }}
+          SERVER_URL: ${{ github.event.client_payload.server_url }}
+          TOKEN: ${{ github.event.client_payload.worker_secret }}
         run: |
-          test -n "$SERVER_URL" || { echo "::error::DRIVE_MIGRATION_ORCHESTRATOR_URL GitHub secret is missing"; exit 1; }
-          test -n "$TOKEN" || { echo "::error::DRIVE_WORKER_SHARED_SECRET GitHub secret is missing"; exit 1; }
+          echo "::add-mask::$TOKEN"
+          test -n "$SERVER_URL" || { echo "::error::Dispatch payload is missing the Migration Orchestrator URL"; exit 1; }
+          test -n "$TOKEN" || { echo "::error::Dispatch payload is missing the worker secret"; exit 1; }
 
       - name: Run migration worker
         env:
-          SERVER_URL: ${{ secrets.DRIVE_MIGRATION_ORCHESTRATOR_URL }}
+          SERVER_URL: ${{ github.event.client_payload.server_url }}
           AGENT_ID: ${{ github.event.client_payload.agent_id }}
           WORKER_INSTANCE_ID: ${{ github.event.client_payload.worker_instance_id || github.run_id }}
           DRIVE_MIGRATION_ID: ${{ github.event.client_payload.migration_id }}
           DRIVE_WORKER_GENERATION: ${{ github.event.client_payload.worker_generation || '' }}
           DRIVE_REPAIR_JOB_ID: ${{ github.event.client_payload.repair_job_id || '' }}
-          TOKEN: ${{ secrets.DRIVE_WORKER_SHARED_SECRET }}
+          TOKEN: ${{ github.event.client_payload.worker_secret }}
           EXIT_AFTER_JOB: ${{ github.event.client_payload.repair_job_id && 'true' || 'false' }}
           MAX_RUNTIME_SECONDS: ${{ github.event.client_payload.max_runtime_seconds || '21300' }}
         run: npm start

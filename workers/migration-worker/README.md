@@ -44,16 +44,16 @@ npm start
 
 The root workflow at `.github/workflows/migration-worker.yml` accepts runtime values from the Drive panel and also detects repository secrets or repository variables.
 
-Required repository secrets:
-
-- `DRIVE_MIGRATION_ORCHESTRATOR_URL`
-- `DRIVE_WORKER_SHARED_SECRET`
+The Orchestrator URL and worker secret are included in each authorized
+`repository_dispatch` event. Shared worker repositories do not need deployment
+specific GitHub Actions secrets. The migration queue database URI is returned
+by the Orchestrator at startup and is never stored in GitHub.
 
 The agent id is passed per dispatch, so one GitHub account and repository can host many separately identified worker registrations. Non-secret tuning values can be added as repository variables, such as `COPY_CONCURRENCY`, `UPLOAD_QUEUE_SIZE`, and `UPLOAD_PART_SIZE_MB`.
 
-Before every manual or queued GitHub launch, the panel and Migration Orchestrator synchronize the destination's current default branch from `GITHUB_WORKER_SOURCE_REPO` (default `iamnadith/Drive`). Forks merge the latest upstream commit without force-pushing. The worker directory and selected workflow are verified against that source snapshot; renamed workflow files and standalone repository copies receive an atomic worker-file update that preserves unrelated files. Conflicts, incomplete responses, or missing permissions stop dispatch. Each run records both commit IDs and checks out the verified worker commit. Setup scans all accessible repository pages, reuses renamed forks or marked copies, and asks for a choice when several match. New forks try the original repository name first, then numbered suffixes only for confirmed name collisions.
+Before every manual or queued GitHub launch, the panel and Migration Orchestrator synchronize the destination's current default branch from `GITHUB_WORKER_SOURCE_REPO` (default `iamnadith/Drive`). They copy and verify only the worker runtime directory and selected workflow in an atomic commit, preserving unrelated repository files and history. This avoids merging the full Drive application into worker forks and triggering unrelated workflows. Conflicts, incomplete responses, or missing permissions stop dispatch. Each run records both commit IDs and checks out the verified worker commit. Setup scans all accessible repository pages, reuses renamed forks or marked copies, and asks for a choice when several match. New forks try the original repository name first, then numbered suffixes only for confirmed name collisions.
 
-The only runtime secrets synchronized to GitHub are the Orchestrator URL and shared worker secret. The queue URI is delivered directly to each authorized worker at startup and is never stored in GitHub. The agent id keeps concurrent workers separately identifiable. A per-claim UUID fences stale processes after recovery. Each worker claims one scanner-generated per-file job at a time and keeps polling for more work. The generation-scoped unique work key gives every source object one durable queue record.
+The queue URI is delivered directly to each authorized worker at startup and is never stored in GitHub. The agent id keeps concurrent workers separately identifiable. A per-claim UUID fences stale processes after recovery. Each worker claims one scanner-generated per-file job at a time and keeps polling for more work. The generation-scoped unique work key gives every source object one durable queue record.
 
 ## Performance tuning
 
