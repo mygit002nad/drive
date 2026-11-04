@@ -1,4 +1,4 @@
-import type { Client } from "pg"
+import { Client } from "pg"
 
 export async function withMigrationQueueDatabase<T>(url: string, operation: (db: Client) => Promise<T>, ssl = true): Promise<T> {
   const connectionString = new URL(url)
