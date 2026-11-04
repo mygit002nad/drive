@@ -1,6 +1,6 @@
 import { Client } from "pg"
 import { syncWorkerRepository } from "../../../src/lib/github-worker-sync"
-import { readMigrationQueueLiveProjectionFromClient } from "../../../src/lib/migration-queue-database"
+import { readMigrationQueueLiveProjectionFromClient } from "../../../src/lib/migration-queue-projection"
 
 type DispatchMessage = { intentId: string } | { control: "cycle" }
 type Env = { POSTGRES_URL?: string; HYPERDRIVE?: { connectionString: string }; MIGRATION_ORCHESTRATOR_SECRET?: string; PANEL_URL?: string; DISABLE_POSTGRES_SSL?: string; GITHUB_WORKER_SOURCE_REPO?: string; GITHUB_BACKEND_WORKER_SOURCE_REPO?: string; GITHUB_DISPATCH_QUEUE: Queue<DispatchMessage> }
